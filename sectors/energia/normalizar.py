@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Normaliza el listado de socios exportado desde TRYLOGYC.
+Normaliza el listado de socios exportado desde TRYLOGYC para el sector Energía.
 
 Uso:
-    python scripts/normalizar_socios.py [ruta_csv] [ruta_salida_csv]
+    python sectors/energia/normalizar.py [ruta_csv] [ruta_salida_csv]
 
 Transformaciones aplicadas:
   - Extrae columnas 11 a 19 (1-indexadas).
@@ -21,11 +21,12 @@ from datetime import datetime
 
 import pandas as pd
 
-# ---------------------------------------------------------------------------
-# Constantes
-# ---------------------------------------------------------------------------
-ROOT = Path(__file__).resolve().parent.parent
-CARPETA_SOCIOS = ROOT / "data" / "socios"
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+from .config import SERVICIO_TIPO
+
+ROOT = Path(__file__).resolve().parent.parent.parent
+CARPETA_SOCIOS = ROOT / "data" / "energia" / "socios"
 SALIDA_DEFAULT = CARPETA_SOCIOS / "socios_normalizados.csv"
 
 COLUMNAS_CSV = {
@@ -40,9 +41,6 @@ COLUMNAS_CSV = {
     18: "estado",
 }
 
-# ---------------------------------------------------------------------------
-# Helpers de normalizacion
-# ---------------------------------------------------------------------------
 
 def _normalizar_nro_socio(valor):
     """
@@ -84,11 +82,17 @@ def _fecha_desde_nombre(path):
     return None
 
 
-# ---------------------------------------------------------------------------
-# Funcion principal
-# ---------------------------------------------------------------------------
-
 def normalizar(ruta_csv, ruta_salida=SALIDA_DEFAULT):
+    """
+    Normaliza un CSV de socios desde TRYLOGYC.
+    
+    Args:
+        ruta_csv: Ruta del CSV crudo
+        ruta_salida: Ruta donde guardar el CSV normalizado
+        
+    Retorna:
+        pd.DataFrame: DataFrame normalizado
+    """
     ruta_csv = Path(ruta_csv)
     ruta_salida = Path(ruta_salida)
 
@@ -101,36 +105,29 @@ def normalizar(ruta_csv, ruta_salida=SALIDA_DEFAULT):
         encoding="latin-1",
     )
 
-    # Extraer columnas 11-19 (indices 10-18)
     indices = list(COLUMNAS_CSV.keys())
     df = df_raw.iloc[:, indices].copy()
     df.columns = list(COLUMNAS_CSV.values())
 
     print(f"  Filas originales: {len(df):,}")
 
-    # Limpieza de espacios en todos los campos
     for col in df.columns:
         df[col] = df[col].str.strip()
 
-    # nro_socio normalizado
     df["nro_socio"] = df["nro_socio_raw"].apply(_normalizar_nro_socio)
     df.drop(columns=["nro_socio_raw"], inplace=True)
 
-    # documento -> tipo_doc + nro_doc
     doc_split = df["documento_raw"].apply(_split_documento)
     df["tipo_doc"] = doc_split.apply(lambda x: x[0])
     df["nro_doc"] = doc_split.apply(lambda x: x[1])
     df.drop(columns=["documento_raw"], inplace=True)
 
-    # medidor vacio -> None
     df["medidor"] = df["medidor"].replace("", None)
 
-    # fecha de extraccion desde nombre de archivo
     fecha_fuente = _fecha_desde_nombre(ruta_csv)
     df["fecha_fuente"] = fecha_fuente
     print(f"  Fecha del archivo: {fecha_fuente}")
 
-    # Reordenar columnas
     df = df[[
         "nro_socio",
         "nombre_socio",
@@ -145,7 +142,6 @@ def normalizar(ruta_csv, ruta_salida=SALIDA_DEFAULT):
         "fecha_fuente",
     ]]
 
-    # Resumen
     print("\n  Filas por servicio:")
     for servicio, cantidad in df["servicio"].value_counts().items():
         print(f"    {servicio:<30} {cantidad:>7,}")
@@ -155,17 +151,13 @@ def normalizar(ruta_csv, ruta_salida=SALIDA_DEFAULT):
         print(f"    {estado:<30} {cantidad:>7,}")
 
     print(f"\n  Socios unicos (nro_socio): {df['nro_socio'].nunique():,}")
-    print(f"  Socios con servicio Energia: {(df['servicio'] == 'Energia').sum():,}")
+    print(f"  Socios con servicio {SERVICIO_TIPO}: {(df['servicio'] == SERVICIO_TIPO).sum():,}")
 
     ruta_salida.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(ruta_salida, index=False, encoding="utf-8")
     print(f"\nGuardado: {ruta_salida}  ({len(df):,} filas)")
     return df
 
-
-# ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
 
 def _archivo_mas_reciente():
     candidatos = sorted(CARPETA_SOCIOS.glob("lista_socios_*.csv"), reverse=True)

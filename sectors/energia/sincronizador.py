@@ -12,15 +12,13 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import pandas as pd
 from sqlalchemy import text
 
-try:
-    from scripts.procesar import build_sqlalchemy_engine, get_db_config
-except ModuleNotFoundError:
-    # Permite ejecucion directa: python scripts/sincronizar_socios_energia.py
-    from procesar import build_sqlalchemy_engine, get_db_config
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from core.db_manager import build_sqlalchemy_engine, get_db_config
 
-ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_INPUT = ROOT / "data" / "socios" / "socios_normalizados.csv"
+ROOT = Path(__file__).resolve().parent.parent.parent
+DEFAULT_INPUT = ROOT / "data" / "energia" / "socios" / "socios_normalizados.csv"
 SERVICIO_OBJETIVO = "Energia"
 MOTIVO_CAMBIO_TARIFA = "Actualizacion mensual TRYLOGYC"
 
@@ -265,7 +263,7 @@ def exportar_reportes_csv(
     dataframes: Dict[str, pd.DataFrame],
 ) -> Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = ROOT / "data" / "socios" / "reportes_sincro_socios" / f"{fecha_fuente}_{ts}"
+    out_dir = ROOT / "data" / "energia" / "reportes_sincro" / f"{fecha_fuente}_{ts}"
     out_dir.mkdir(parents=True, exist_ok=True)
     for nombre, df in dataframes.items():
         salida = out_dir / f"{nombre}.csv"
