@@ -120,9 +120,9 @@ def procesar_periodo(anio, mes):
 
 
 # --- Ejecución ---
-if __name__ == "__main__":
+if __name__ == "__main__":  
     anio_a_procesar = "2026"
-    mes_a_procesar = "04"
+    mes_a_procesar = "05"
     
     print("--- Iniciando proceso ---")
     
