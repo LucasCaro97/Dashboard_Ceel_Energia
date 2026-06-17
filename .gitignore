@@ -17,3 +17,7 @@ data/
 .DS_Store
 Thumbs.db
 .vscode/
+
+# Archivos de datos locales (no subir a GitHub)
+medidores_normalizados.csv
+medidores_sin_procesar.xlsx
