@@ -9,6 +9,8 @@ from html import escape
 import json
 import os
 
+from common.periods import fetch_periodos_disponibles
+
 try:
     from streamlit_echarts import st_echarts
 except ImportError:
@@ -69,57 +71,47 @@ def to_periodo_sql(value):
 
 @st.cache_data
 def get_periodos_disponibles():
+    return fetch_periodos_disponibles(engine)
+
+
+@st.cache_data
+def get_kpi_por_sector_sp(periodo):
+    """KPIs del período desde sp_kpi_por_sector(sector, periodo)."""
+    if not periodo:
+        return None
     try:
-        df = pd.read_sql(
-            text(
-                f"""
-                SELECT DISTINCT periodo
-                FROM {VIEW_INTERNET}
-                WHERE periodo IS NOT NULL
-                ORDER BY periodo DESC
-                """
-            ),
-            engine,
-        )
-        if df is None or df.empty:
-            return []
-        return pd.to_datetime(df["periodo"], errors="coerce").dropna().dt.strftime("%Y-%m-%d").tolist()
+        with engine.connect() as conn:
+            result = conn.execute(
+                text("CALL sp_kpi_por_sector(:sector, :periodo)"),
+                {"sector": SERVICIO_TIPO, "periodo": periodo},
+            )
+            rows = result.fetchall()
+            cols = list(result.keys())
+        if not rows:
+            return None
+        return dict(zip(cols, rows[0]))
     except Exception:
-        return []
+        return None
 
 
 @st.cache_data
 def get_total_facturado_sp(periodo):
     """Total facturado para el período, obtenido desde sp_kpi_por_sector."""
-    try:
-        with engine.connect() as conn:
-            result = conn.execute(text("CALL sp_kpi_por_sector('internet')"))
-            rows = result.fetchall()
-            cols = list(result.keys())
-
-        if not rows:
-            return 0.0
-
-        df = pd.DataFrame(rows, columns=cols)
-        df["periodo"] = pd.to_datetime(df["periodo"], errors="coerce")
-
-        if periodo:
-            periodo_ts = pd.to_datetime(periodo, errors="coerce")
-            match = df[df["periodo"] == periodo_ts]
-            if match.empty:
-                return 0.0
-            val = match.iloc[0]["total_facturado"]
-        else:
-            val = df["total_facturado"].sum()
-
-        return float(val) if val is not None else 0.0
-    except Exception:
+    kpi = get_kpi_por_sector_sp(periodo)
+    if not kpi:
         return 0.0
+    val = pd.to_numeric(kpi.get("total_facturado"), errors="coerce")
+    return float(val) if pd.notna(val) else 0.0
 
 
 @st.cache_data
 def get_cantidad_facturas(periodo):
-    """Cantidad de facturas desde la vista (la procedure no lo provee)."""
+    """Cantidad de facturas: prioriza sp_kpi_por_sector, con fallback a la vista."""
+    kpi = get_kpi_por_sector_sp(periodo)
+    if kpi and kpi.get("cantidad_facturas") is not None:
+        val = pd.to_numeric(kpi.get("cantidad_facturas"), errors="coerce")
+        if pd.notna(val):
+            return int(val)
     try:
         params = {"periodo": periodo} if periodo else {}
         where = "WHERE periodo = :periodo" if periodo else ""
