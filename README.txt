@@ -1,304 +1,217 @@
 ================================================================================
-  AUTOMATIZACION CEEL - Guia de uso del proyecto
+  AUTOMATIZACION CEEL
 ================================================================================
 
 Base de datos: conecciones_energia (MySQL)
-
-Este proyecto automatiza:
-  - Carga mensual de conceptos de facturacion (TRYLOGYC -> facturacion_conceptos)
-  - Sincronizacion mensual de socios de Energia (TRYLOGYC -> socios_energia,
-    socios_medidores, socio_historial_tarifas)
-  - Visualizacion de KPIs y graficos (dashboard Streamlit)
+Sectores: energia | agua | gas | internet | television
 
 
 ================================================================================
 0. CONFIGURACION INICIAL (solo la primera vez)
 ================================================================================
 
-1) Crear entorno virtual e instalar dependencias:
+  python -m venv venv
+  .\venv\Scripts\activate
+  pip install -r requirements.txt
 
-   python -m venv venv
-   .\venv\Scripts\activate
-   pip install -r requirements.txt
+  Copiar .env.example -> .env y completar:
 
-2) Configurar conexion a MySQL:
-
-   Copiar .env.example a .env y completar credenciales:
-
-   DB_HOST=localhost
-   DB_PORT=3306
-   DB_USER=tu_usuario
-   DB_PASSWORD=tu_password
-   DB_NAME=conecciones_energia
-
-   (Alternativa: DB_URL=mysql+pymysql://usuario:password@host:3306/conecciones_energia)
-
-3) Activar el entorno virtual antes de cada tarea:
-
-   .\venv\Scripts\activate
+    DB_HOST=localhost
+    DB_PORT=3306
+    DB_USER=tu_usuario
+    DB_PASSWORD=tu_password
+    DB_NAME=conecciones_energia
 
 
 ================================================================================
-1. INYECTAR DATOS DE FACTURACION (facturacion_conceptos)
+1. PREPARAR ARCHIVOS DE ENTRADA
 ================================================================================
 
-Script: scripts/procesar.py
+Cada sector tiene su propio directorio bajo data/. Los archivos exportados
+desde TRYLOGYC se depositan antes de ejecutar cualquier script.
 
-Que hace:
-  - Lee archivos .txt exportados de TRYLOGYC desde data/inbox/<anio>/<mes>/
-  - Normaliza columnas y cruza con la tabla Conceptos_Maestro
-  - Genera Excel de control en data/processed/<anio>/<mes>/
-  - Inserta filas en la tabla facturacion_conceptos (modo append)
+----------------------------------------------------------------------
+1A. Facturacion (TXT de conceptos)
+----------------------------------------------------------------------
 
-Estructura esperada de archivos de entrada:
+Ruta: data/<sector>/inbox/<AAAA>/<MM>/
 
-  data/inbox/2026/05/adicionales/adicionales_910.txt
-  data/inbox/2026/05/energia/energia_123.txt
-  ...
+  data/energia/inbox/2026/06/
+    energia_123.txt
+    adicionales_910.txt
+    ...
 
-  Formato del nombre: <servicio>_<id_concepto>.txt
-  Separador del TXT: punto y coma (;)
-  Encoding: latin1
+Nombre del archivo: <servicio>_<id_concepto>.txt
+Formato interno:    columnas separadas por ";" , encoding latin1
+Encoding:           latin1
 
-Pasos:
+----------------------------------------------------------------------
+1B. Socios (listado TRYLOGYC)
+----------------------------------------------------------------------
 
-  A) Colocar los .txt del periodo en:
-     data/inbox/<AAAA>/<MM>/
+Ruta: data/<sector>/socios/
 
-  B) Editar en scripts/procesar.py las variables del periodo a procesar
-     (al final del archivo):
+  data/energia/socios/lista_socios_17062026.csv
 
-     anio_a_procesar = "2026"
-     mes_a_procesar = "05"
+Nombre del archivo: lista_socios_DDMMAAAA.csv  (la fecha permite
+  detectar el archivo mas reciente automaticamente)
+Encoding:           latin1 (el normalizador lo convierte a UTF-8)
 
-  C) Ejecutar:
+Nota: el CSV exportado por TRYLOGYC contiene TODOS los servicios en un
+  mismo archivo. El normalizador lo procesa completo; el sincronizador
+  filtra por el servicio del sector correspondiente.
 
-     .\venv\Scripts\python.exe scripts\procesar.py
+
+================================================================================
+2. PROCESAR FACTURACION
+================================================================================
+
+Lee los TXT del periodo, los cruza con Conceptos_Maestro e inserta
+en facturacion_conceptos.
+
+# 1. Verificar sin riesgo
+python scripts/procesar.py --sector internet --año 2026 --mes 05 --dry-run
+
+# 2. Si todo OK, inyectar
+python scripts/procesar.py --sector internet --año 2026 --mes 05
 
 Salidas:
-  - Excel: data/processed/<anio>/<mes>/ENERGIA_conceptos_facturados_<anio>_<mes>.xlsx
-  - Insercion en BD: tabla facturacion_conceptos
+  - Excel de control: data/energia/processed/2026/06/
+  - Insercion en BD:  facturacion_conceptos (modo append)
 
-Validaciones automaticas:
-  - Si no encuentra archivos en la carpeta del periodo, aborta.
-  - Si hay conceptos en los TXT que no existen en Conceptos_Maestro, aborta
-    e imprime la lista de faltantes (no inyecta datos invalidos).
-
-Nota:
-  - El script usa if_exists='append': cada ejecucion AGREGA filas.
-    No borra periodos anteriores. Evitar ejecutar dos veces el mismo periodo
-    si no corresponde duplicar datos.
+Precaucion: no ejecutar dos veces el mismo periodo (duplica registros).
 
 
 ================================================================================
-2. INYECTAR / SINCRONIZAR DATOS DE SOCIOS (Energia)
+3. NORMALIZAR SOCIOS
 ================================================================================
 
-Flujo en 2 pasos: normalizar CSV crudo -> sincronizar contra BD.
+Extrae las columnas utiles del CSV crudo y los deja listos para sincronizar.
+
+  # Toma el lista_socios_*.csv mas reciente
+  .\venv\Scripts\python.exe scripts\normalizar.py --sector energia
+
+  # Con archivo explicito
+  .\venv\Scripts\python.exe scripts\normalizar.py --sector agua --input data\agua\socios\lista_socios_17062026.csv
+
+Salida: data/<sector>/socios/socios_normalizados.csv
+
+Transformaciones aplicadas:
+  - nro_socio: "00000002/000001" -> "000002/0001"
+  - documento: "DNI-9048914"    -> tipo_doc=DNI, nro_doc=9048914
+  - fecha_fuente extraida del nombre del archivo
+
+
+================================================================================
+4. SINCRONIZAR SOCIOS CONTRA LA BD
+================================================================================
 
 Tablas afectadas:
-  - socios_energia          (estado y nombre por nro_socio + servicio_tipo)
-  - socios_medidores        (relacion 1:N de medidores; baja logica con estado=0)
-  - socio_historial_tarifas (historial de tarifas con vigencias)
+  socios_<sector>         upsert por (nro_socio, servicio_tipo)
+  socios_medidores        inserta nuevos; inactiva ausentes (estado=0)
+  socio_historial_tarifas cierra vigencia anterior e inserta nueva si cambia
 
-----------------------------------------------------------------------
-PASO 2A - Normalizar export de TRYLOGYC
-----------------------------------------------------------------------
+SIEMPRE simular primero:
 
-Script: scripts/normalizar_socios.py
+  .\venv\Scripts\python.exe scripts\sincronizar.py --sector energia --dry-run --export-reportes-csv
 
-Entrada:
-  - CSV crudo exportado de TRYLOGYC, por ejemplo:
-    data/socios/lista_socios_17062026.csv
+  Revisa los CSVs generados en data/<sector>/reportes_sincro/<fecha>_<ts>/
+    socios_insertados.csv
+    socios_actualizados.csv
+    medidores_insertados.csv / medidores_inactivados.csv
+    tarifas_creadas.csv / tarifas_cambiadas.csv / tarifas_no_mapeadas.csv
 
-Salida:
-  - data/socios/socios_normalizados.csv
+Ejecucion real (solo si el dry-run se ve correcto):
 
-Comando (toma el lista_socios_*.csv mas reciente de data/socios/):
+  .\venv\Scripts\python.exe scripts\sincronizar.py --sector energia --export-reportes-csv
 
-  .\venv\Scripts\python.exe scripts\normalizar_socios.py
-
-Comando con archivo explicito:
-
-  .\venv\Scripts\python.exe scripts\normalizar_socios.py data\socios\lista_socios_17062026.csv
-
-Que normaliza:
-  - Extrae columnas utiles (11 a 19 del export TRYLOGYC)
-  - nro_socio al formato BD (ej: 00000002/000001 -> 000002/0001)
-  - Separa documento en tipo_doc y nro_doc
-  - Agrega fecha_fuente desde el nombre del archivo
-
-----------------------------------------------------------------------
-PASO 2B - Sincronizar contra MySQL
-----------------------------------------------------------------------
-
-Script: scripts/sincronizar_socios_energia.py
-
-Procesa SOLO filas con servicio = "Energia".
-
-Reglas principales:
-  - socios_energia: inserta nuevos; actualiza estado si cambio; actualiza nombre
-  - socios_medidores: inserta nuevos; mantiene existentes; inactiva (estado=0)
-    los que no vienen en el snapshot mensual; NO modifica columna act
-  - socio_historial_tarifas: cierra vigencia anterior e inserta nueva si cambia
-    la tarifa asignada
-
-RECOMENDADO - Simular antes de guardar (dry-run + reportes CSV):
-
-  .\venv\Scripts\python.exe scripts\sincronizar_socios_energia.py --dry-run --export-reportes-csv
-
-  - No persiste cambios en BD (hace rollback al final)
-  - Genera CSVs de control en:
-    data/socios/reportes_sincro_socios/<fecha_fuente>_<timestamp>/
-      socios_insertados.csv
-      socios_actualizados.csv
-      medidores_insertados.csv
-      medidores_inactivados.csv
-      tarifas_creadas.csv
-      tarifas_cambiadas.csv
-      tarifas_no_mapeadas.csv
-
-EJECUCION REAL (persiste cambios + historial CSV):
-
-  .\venv\Scripts\python.exe scripts\sincronizar_socios_energia.py --export-reportes-csv
-
-Opciones utiles:
-
-  --input <ruta_csv>         CSV normalizado (default: socios_normalizados.csv)
-  --dry-run                  Simula sin commit
-  --export-reportes-csv      Exporta reportes de cambios para auditoria
-
-Documentacion detallada: scripts/README_sincronizar_socios_energia.md
+Mismo flujo para cualquier otro sector (--sector agua, --sector gas, etc.).
 
 
 ================================================================================
-3. DASHBOARD DE FACTURACION (visualizacion)
+5. DASHBOARD
 ================================================================================
-
-Script: app_dashboard.py
-
-Muestra KPIs, graficos de distribucion, top consumidores, correlacion, etc.
-Consulta vistas pre-agregadas en MySQL (v_kpi_facturacion,
-v_totalizado_por_tarifa_base, v_reporte_facturacion_energia, etc.).
-
-Ejecutar:
 
   .\venv\Scripts\activate
-  streamlit run app_dashboard.py
+  streamlit run dashboards\energia_dashboard.py
 
-Se abre en el navegador (por defecto http://localhost:8501).
-
-Filtros en sidebar:
-  - Periodo
-  - Cantidad de categorias (Top N)
-
-Nota: el dashboard solo LEE datos de la BD; no modifica tablas.
+Abre en http://localhost:8501  (solo lectura, no modifica la BD).
 
 
 ================================================================================
-4. NORMALIZAR MEDIDORES (auxiliar, sin inyeccion a BD en este repo)
+6. FLUJO MENSUAL RESUMIDO
 ================================================================================
 
-Script: scripts/normalizar_medidores.py
+[ ] Exportar desde TRYLOGYC:
+      TXT conceptos  -> data/<sector>/inbox/<AAAA>/<MM>/
+      CSV socios     -> data/<sector>/socios/lista_socios_DDMMAAAA.csv
 
-Entrada:  medidores_sin_procesar.xlsx (raiz del proyecto)
-Salida:   medidores_normalizados.csv (raiz del proyecto)
+[ ] Socios (por sector):
+      scripts\normalizar.py  --sector <sector>
+      scripts\sincronizar.py --sector <sector> --dry-run --export-reportes-csv
+      -- revisar reportes --
+      scripts\sincronizar.py --sector <sector> --export-reportes-csv
 
-Desglosa filas con varios medidores separados por coma en una fila por
-medidor (NRO_SOCIO, MEDIDOR, CATEGORIA_MEDIDOR).
+[ ] Facturacion:
+      scripts\procesar.py --sector <sector> --año AAAA --mes MM
 
-  .\venv\Scripts\python.exe scripts\normalizar_medidores.py
-
-Este script NO escribe en MySQL desde este proyecto. La sincronizacion de
-medidores hacia BD se hace via sincronizar_socios_energia.py (Paso 2B).
-
-
-================================================================================
-5. FLUJO MENSUAL RECOMENDADO (checklist)
-================================================================================
-
-[ ] 1. Exportar desde TRYLOGYC:
-        - TXT de conceptos -> data/inbox/<anio>/<mes>/
-        - Listado de socios -> data/socios/lista_socios_DDMMAAAA.csv
-
-[ ] 2. Socios:
-        - Ejecutar scripts/normalizar_socios.py
-        - Ejecutar sincronizar con --dry-run --export-reportes-csv
-        - Revisar CSVs en data/socios/reportes_sincro_socios/
-        - Si todo OK: ejecutar sincronizar sin --dry-run
-
-
-[ ] 3. Facturacion:
-        - Ajustar anio/mes en scripts/procesar.py
-        - Ejecutar scripts/procesar.py
-        - Verificar Excel en data/processed/
-
-[ ] 4. Dashboard:
-        - streamlit run app_dashboard.py
-        - Validar KPIs y graficos del periodo cargado
+[ ] Dashboard:
+      streamlit run dashboards\energia_dashboard.py
 
 
 ================================================================================
-6. ESTRUCTURA DE CARPETAS PRINCIPAL
+7. ESTRUCTURA DE CARPETAS
 ================================================================================
 
 automatizacion_ceel/
-  app_dashboard.py              Dashboard Streamlit
-  requirements.txt              Dependencias Python
-  .env                          Credenciales BD (no commitear)
+  core/
+    db_manager.py          Conexion MySQL compartida
+    normalizar_base.py     Logica de normalizacion TRYLOGYC (todos los sectores)
+    sector_sync.py         Logica de sincronizacion generica (todos los sectores)
+  sectors/
+    energia/               Implementado
+      config.py
+      procesador.py
+      normalizar.py
+      sincronizador.py
+    agua/                  Implementado
+    gas/                   Implementado
+    internet/              Implementado
+    television/            Implementado
   scripts/
-    procesar.py                 Carga facturacion_conceptos
-    normalizar_socios.py        Limpia CSV de socios TRYLOGYC
-    sincronizar_socios_energia.py  Sync socios/medidores/tarifas
-    normalizar_medidores.py     Normaliza Excel de medidores (auxiliar)
+    procesar.py            Wrapper CLI -> facturacion_conceptos
+    normalizar.py          Wrapper CLI -> socios_normalizados.csv
+    sincronizar.py         Wrapper CLI -> BD (socios/medidores/tarifas)
+  dashboards/
+    energia_dashboard.py   Streamlit
   data/
-    inbox/<anio>/<mes>/         TXT conceptos facturacion (entrada)
-    processed/<anio>/<mes>/     Excel procesado (salida control)
-    socios/                     CSV socios TRYLOGYC y normalizados
-    socios/reportes_sincro_socios/  Historial de cambios por corrida
+    <sector>/
+      inbox/<AAAA>/<MM>/   TXT conceptos (entrada procesar.py)
+      processed/           Excel de control (salida procesar.py)
+      socios/              CSV crudo y normalizado
+      reportes_sincro/     Historial de cambios por corrida
 
 
 ================================================================================
-7. TABLAS MYSQL REFERENCIADAS
+8. ERRORES FRECUENTES
 ================================================================================
 
-Facturacion:
-  - Conceptos_Maestro       (maestro de conceptos; requerido por procesar.py)
-  - facturacion_conceptos   (destino de scripts/procesar.py)
+"No files found in data/.../inbox/..."
+  -> Verificar que los .txt esten en data/<sector>/inbox/<AAAA>/<MM>/
 
-Socios:
-  - socios_energia
-  - socios_medidores
-  - socio_historial_tarifas
-  - tarifa_base             (maestro de tarifas)
-
-Dashboard (vistas, solo lectura):
-  - v_kpi_facturacion
-  - v_totalizado_por_tarifa_base
-  - v_reporte_facturacion_energia
-  - vista_socios_tarifa_actual
-
-
-================================================================================
-8. SOLUCION DE PROBLEMAS FRECUENTES
-================================================================================
-
-"No se encontraron archivos en data/inbox/..."
-  -> Verificar ruta anio/mes y que los .txt esten en subcarpetas del periodo.
-
-"CONCEPTOS NO ENCONTRADOS EN EL MAESTRO"
+"CONCEPTS NOT FOUND IN MASTER"
   -> Agregar los conceptos faltantes a Conceptos_Maestro antes de reintentar.
 
 "Faltan variables de entorno..."
-  -> Crear/completar archivo .env en la raiz del proyecto.
+  -> Crear/completar .env en la raiz del proyecto.
 
-Dashboard sin datos / KPIs en cero:
-  -> Verificar periodo seleccionado y que existan datos cargados para ese mes.
+"No hay filas de servicio X para procesar"
+  -> El valor SERVICIO_TIPO en sectors/<sector>/config.py debe coincidir
+     exactamente con el que TRYLOGYC escribe en la columna 'servicio' del CSV.
 
-Sincronizacion socios - revisar cambios antes de commit:
-  -> Siempre usar --dry-run --export-reportes-csv primero.
+Error de importacion:
+  -> Ejecutar siempre desde la raiz del proyecto.
+  -> Usar .\venv\Scripts\python.exe, no python directamente.
 
 
-================================================================================
-Fin de la guia
 ================================================================================

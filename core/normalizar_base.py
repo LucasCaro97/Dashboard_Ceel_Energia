@@ -1,33 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Normaliza el listado de socios exportado desde TRYLOGYC.
+Logica base de normalizacion para exportaciones TRYLOGYC.
 
-Uso:
-    python scripts/normalizar_socios.py [ruta_csv] [ruta_salida_csv]
-
-Transformaciones aplicadas:
-  - Extrae columnas 11 a 19 (1-indexadas).
-  - Encoding latin-1 (formato TRYLOGYC).
-  - nro_socio: "00000002/000001" -> "000002/0001" (6 digitos / 4 digitos).
-  - documento: split "DNI-9048914" -> tipo_doc=DNI, nro_doc=9048914.
-  - Todos los campos de texto: strip de espacios.
-  - fecha_fuente: extraida del nombre del archivo (lista_socios_DDMMAAAA.csv).
+Reutilizable por todos los sectores que exportan el mismo formato
+de listado de socios (columnas 10-18 del CSV crudo de TRYLOGYC).
 """
 
 import re
-import sys
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 
-# ---------------------------------------------------------------------------
-# Constantes
-# ---------------------------------------------------------------------------
-ROOT = Path(__file__).resolve().parent.parent
-CARPETA_SOCIOS = ROOT / "data" / "socios"
-SALIDA_DEFAULT = CARPETA_SOCIOS / "socios_normalizados.csv"
-
+# Indices de columnas extraidas del CSV crudo de TRYLOGYC (0-based)
 COLUMNAS_CSV = {
     10: "nro_socio_raw",
     11: "nombre_socio",
@@ -40,11 +25,8 @@ COLUMNAS_CSV = {
     18: "estado",
 }
 
-# ---------------------------------------------------------------------------
-# Helpers de normalizacion
-# ---------------------------------------------------------------------------
 
-def _normalizar_nro_socio(valor):
+def _normalizar_nro_socio(valor: str) -> str:
     """
     Convierte el formato TRYLOGYC al formato de la BD.
     "00000002/000001" -> "000002/0001"
@@ -58,7 +40,7 @@ def _normalizar_nro_socio(valor):
     return f"{titular}/{suministro}"
 
 
-def _split_documento(valor):
+def _split_documento(valor: str):
     """
     "DNI-9048914" -> ("DNI", "9048914")
     "S.D."        -> ("S.D.", "")
@@ -70,7 +52,13 @@ def _split_documento(valor):
     return valor, ""
 
 
-def _fecha_desde_nombre(path):
+def _limpiar_texto_celda(valor: str) -> str:
+    """Quita saltos de linea embebidos (TRYLOGYC) y colapsa espacios."""
+    texto = str(valor).replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    return re.sub(r"\s+", " ", texto).strip()
+
+
+def _fecha_desde_nombre(path: Path):
     """
     Extrae la fecha del nombre del archivo.
     "lista_socios_17062026.csv" -> "2026-06-17"
@@ -84,11 +72,22 @@ def _fecha_desde_nombre(path):
     return None
 
 
-# ---------------------------------------------------------------------------
-# Funcion principal
-# ---------------------------------------------------------------------------
+def normalizar(ruta_csv: Path, ruta_salida: Path, servicio_tipo: str = None) -> pd.DataFrame:
+    """
+    Normaliza un CSV de socios exportado desde TRYLOGYC.
 
-def normalizar(ruta_csv, ruta_salida=SALIDA_DEFAULT):
+    El CSV resultante conserva todos los servicios; el filtro por sector
+    se aplica en el paso de sincronizacion. Si se indica ``servicio_tipo``
+    se imprime el conteo especifico de ese servicio al final.
+
+    Args:
+        ruta_csv: Ruta del CSV crudo de TRYLOGYC.
+        ruta_salida: Ruta donde guardar el CSV normalizado.
+        servicio_tipo: Nombre del servicio a reportar en el resumen (opcional).
+
+    Returns:
+        pd.DataFrame con los registros normalizados (todos los servicios).
+    """
     ruta_csv = Path(ruta_csv)
     ruta_salida = Path(ruta_salida)
 
@@ -101,36 +100,29 @@ def normalizar(ruta_csv, ruta_salida=SALIDA_DEFAULT):
         encoding="latin-1",
     )
 
-    # Extraer columnas 11-19 (indices 10-18)
     indices = list(COLUMNAS_CSV.keys())
     df = df_raw.iloc[:, indices].copy()
     df.columns = list(COLUMNAS_CSV.values())
 
     print(f"  Filas originales: {len(df):,}")
 
-    # Limpieza de espacios en todos los campos
     for col in df.columns:
-        df[col] = df[col].str.strip()
+        df[col] = df[col].apply(_limpiar_texto_celda)
 
-    # nro_socio normalizado
     df["nro_socio"] = df["nro_socio_raw"].apply(_normalizar_nro_socio)
     df.drop(columns=["nro_socio_raw"], inplace=True)
 
-    # documento -> tipo_doc + nro_doc
     doc_split = df["documento_raw"].apply(_split_documento)
     df["tipo_doc"] = doc_split.apply(lambda x: x[0])
     df["nro_doc"] = doc_split.apply(lambda x: x[1])
     df.drop(columns=["documento_raw"], inplace=True)
 
-    # medidor vacio -> None
     df["medidor"] = df["medidor"].replace("", None)
 
-    # fecha de extraccion desde nombre de archivo
     fecha_fuente = _fecha_desde_nombre(ruta_csv)
     df["fecha_fuente"] = fecha_fuente
     print(f"  Fecha del archivo: {fecha_fuente}")
 
-    # Reordenar columnas
     df = df[[
         "nro_socio",
         "nombre_socio",
@@ -145,7 +137,6 @@ def normalizar(ruta_csv, ruta_salida=SALIDA_DEFAULT):
         "fecha_fuente",
     ]]
 
-    # Resumen
     print("\n  Filas por servicio:")
     for servicio, cantidad in df["servicio"].value_counts().items():
         print(f"    {servicio:<30} {cantidad:>7,}")
@@ -155,7 +146,9 @@ def normalizar(ruta_csv, ruta_salida=SALIDA_DEFAULT):
         print(f"    {estado:<30} {cantidad:>7,}")
 
     print(f"\n  Socios unicos (nro_socio): {df['nro_socio'].nunique():,}")
-    print(f"  Socios con servicio Energia: {(df['servicio'] == 'Energia').sum():,}")
+    if servicio_tipo:
+        conteo = (df['servicio'] == servicio_tipo).sum()
+        print(f"  Socios con servicio {servicio_tipo}: {conteo:,}")
 
     ruta_salida.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(ruta_salida, index=False, encoding="utf-8")
@@ -163,20 +156,11 @@ def normalizar(ruta_csv, ruta_salida=SALIDA_DEFAULT):
     return df
 
 
-# ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
-
-def _archivo_mas_reciente():
-    candidatos = sorted(CARPETA_SOCIOS.glob("lista_socios_*.csv"), reverse=True)
+def archivo_mas_reciente(carpeta: Path) -> Path:
+    """Devuelve el lista_socios_*.csv mas reciente en la carpeta indicada."""
+    candidatos = sorted(carpeta.glob("lista_socios_*.csv"), reverse=True)
     if not candidatos:
         raise FileNotFoundError(
-            f"No se encontro ningun lista_socios_*.csv en {CARPETA_SOCIOS}"
+            f"No se encontro ningun lista_socios_*.csv en {carpeta}"
         )
     return candidatos[0]
-
-
-if __name__ == "__main__":
-    ruta_entrada = Path(sys.argv[1]) if len(sys.argv) > 1 else _archivo_mas_reciente()
-    ruta_salida = Path(sys.argv[2]) if len(sys.argv) > 2 else SALIDA_DEFAULT
-    normalizar(ruta_entrada, ruta_salida)
