@@ -1,18 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Normaliza el listado de socios exportado desde TRYLOGYC para el sector Energia.
+Normaliza el listado de socios exportado desde TRYLOGYC para el sector Television.
 
 Uso:
-    python sectors/energia/normalizar.py [ruta_csv] [ruta_salida_csv]
+    python sectors/television/normalizar.py [ruta_csv] [ruta_salida_csv]
 
-Transformaciones aplicadas (via core.normalizar_base):
-  - Extrae columnas 11 a 19 (1-indexadas).
-  - Encoding latin-1 (formato TRYLOGYC).
-  - nro_socio: "00000002/000001" -> "000002/0001" (6 digitos / 4 digitos).
-  - documento: split "DNI-9048914" -> tipo_doc=DNI, nro_doc=9048914.
-  - Todos los campos de texto: strip de espacios.
-  - dom_consumo / dom_postal: saltos de linea TRYLOGYC -> espacio.
-  - fecha_fuente: extraida del nombre del archivo (lista_socios_DDMMAAAA.csv).
+El CSV crudo tiene la misma estructura que el sector Energia (columnas 10-18).
 """
 
 import sys
@@ -24,17 +17,13 @@ from core.normalizar_base import normalizar as _normalizar_base, archivo_mas_rec
 from .config import SERVICIO_TIPO
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-CARPETA_SOCIOS = ROOT / "data" / "energia" / "socios"
+CARPETA_SOCIOS = ROOT / "data" / "television" / "socios"
 SALIDA_DEFAULT = CARPETA_SOCIOS / "socios_normalizados.csv"
 
 
 def normalizar(ruta_csv, ruta_salida=SALIDA_DEFAULT):
     """
-    Normaliza un CSV de socios desde TRYLOGYC para el sector Energia.
-
-    Delega toda la logica a ``core.normalizar_base.normalizar``.
-    El CSV de salida conserva todos los servicios; el filtro por
-    ``servicio == "Energia"`` se aplica en el paso de sincronizacion.
+    Normaliza un CSV de socios desde TRYLOGYC para el sector Television.
 
     Args:
         ruta_csv: Ruta del CSV crudo de TRYLOGYC.

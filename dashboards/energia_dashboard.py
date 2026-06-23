@@ -88,7 +88,7 @@ def get_periodos_disponibles():
         query = text(
             """
             SELECT DISTINCT periodo
-            FROM conecciones_energia.v_reporte_facturacion_energia
+            FROM conecciones_energia.v_consolidado_facturas_final
             WHERE periodo IS NOT NULL
             ORDER BY periodo DESC
             """
@@ -97,7 +97,6 @@ def get_periodos_disponibles():
         if df_periodos is None or df_periodos.empty:
             return []
         periodos = pd.to_datetime(df_periodos['periodo'], errors='coerce').dropna()
-        # Devuelve en formato YYYY-MM-DD
         return periodos.dt.strftime('%Y-%m-%d').tolist()
     except Exception:
         return []
@@ -170,178 +169,186 @@ def get_totalizado_por_tarifa_base(periodo):
 @st.cache_data
 def get_facturacion_por_tarifa_base(periodo):
     cols = ['tarifa_base', 'total_facturado']
-    df_tarifa = get_totalizado_por_tarifa_base(periodo)
-    if df_tarifa.empty:
+    try:
+        if periodo:
+            query = text(
+                """
+                SELECT
+                    COALESCE(NULLIF(TRIM(tarifa_base), ''), 'Sin Definir') AS tarifa_base,
+                    SUM(COALESCE(total_factura, 0)) AS total_facturado
+                FROM conecciones_energia.v_consolidado_facturas_final
+                WHERE periodo = :periodo
+                GROUP BY COALESCE(NULLIF(TRIM(tarifa_base), ''), 'Sin Definir')
+                ORDER BY total_facturado DESC
+                """
+            )
+            df = pd.read_sql(query, engine, params={'periodo': periodo})
+        else:
+            query = text(
+                """
+                SELECT
+                    COALESCE(NULLIF(TRIM(tarifa_base), ''), 'Sin Definir') AS tarifa_base,
+                    SUM(COALESCE(total_factura, 0)) AS total_facturado
+                FROM conecciones_energia.v_consolidado_facturas_final
+                GROUP BY COALESCE(NULLIF(TRIM(tarifa_base), ''), 'Sin Definir')
+                ORDER BY total_facturado DESC
+                """
+            )
+            df = pd.read_sql(query, engine)
+        if df is None or df.empty:
+            return pd.DataFrame(columns=cols)
+        df['total_facturado'] = pd.to_numeric(df['total_facturado'], errors='coerce').fillna(0.0)
+        df = df[df['total_facturado'] > 0]
+        return df[cols]
+    except Exception:
         return pd.DataFrame(columns=cols)
-    return df_tarifa[cols]
+
 
 @st.cache_data
+def get_facturacion_por_escalon(periodo):
+    cols = ['escalon_asignado', 'total_facturado']
+    try:
+        if periodo:
+            query = text(
+                """
+                SELECT
+                    COALESCE(NULLIF(TRIM(escalon_asignado), ''), 'Sin Escalón') AS escalon_asignado,
+                    SUM(COALESCE(total_factura, 0)) AS total_facturado
+                FROM conecciones_energia.v_consolidado_facturas_final
+                WHERE periodo = :periodo
+                GROUP BY COALESCE(NULLIF(TRIM(escalon_asignado), ''), 'Sin Escalón')
+                ORDER BY total_facturado DESC
+                """
+            )
+            df = pd.read_sql(query, engine, params={'periodo': periodo})
+        else:
+            query = text(
+                """
+                SELECT
+                    COALESCE(NULLIF(TRIM(escalon_asignado), ''), 'Sin Escalón') AS escalon_asignado,
+                    SUM(COALESCE(total_factura, 0)) AS total_facturado
+                FROM conecciones_energia.v_consolidado_facturas_final
+                GROUP BY COALESCE(NULLIF(TRIM(escalon_asignado), ''), 'Sin Escalón')
+                ORDER BY total_facturado DESC
+                """
+            )
+            df = pd.read_sql(query, engine)
+        if df is None or df.empty:
+            return pd.DataFrame(columns=cols)
+        df['total_facturado'] = pd.to_numeric(df['total_facturado'], errors='coerce').fillna(0.0)
+        df = df[df['total_facturado'] > 0]
+        return df[cols]
+    except Exception:
+        return pd.DataFrame(columns=cols)
+
+@st.cache_data
+def _get_facturas_raw_por_periodo(periodo):
+    """Una fila por factura desde v_consolidado_facturas_final + nombre_socio.
+    Fuente única para Top 10 y Correlación; se cachea una sola vez por período."""
+    cols = [
+        'nro_factura', 'nro_socio', 'nombre_socio',
+        'tarifa_base', 'escalon_asignado',
+        'consumo_kwh_real', 'promedio_energia_pura',
+        'dinero_energia', 'total_factura',
+    ]
+    try:
+        base_select = """
+            SELECT
+                f.nro_factura,
+                f.nro_socio,
+                COALESCE(NULLIF(TRIM(s.nombre_socio), ''), 'Sin Nombre') AS nombre_socio,
+                COALESCE(NULLIF(TRIM(f.tarifa_base), ''), 'Sin Definir') AS tarifa_base,
+                COALESCE(NULLIF(TRIM(f.escalon_asignado), ''), 'Sin Escalón') AS escalon_asignado,
+                COALESCE(f.consumo_kwh_real, 0) AS consumo_kwh_real,
+                COALESCE(f.promedio_energia_pura, 0) AS promedio_energia_pura,
+                COALESCE(f.dinero_energia, 0) AS dinero_energia,
+                COALESCE(f.total_factura, 0) AS total_factura
+            FROM conecciones_energia.v_consolidado_facturas_final f
+            LEFT JOIN conecciones_energia.socios_energia s
+                ON s.nro_socio = f.nro_socio AND s.servicio_tipo = 'Energia'
+        """
+        if periodo:
+            df = pd.read_sql(
+                text(base_select + " WHERE f.periodo = :periodo"),
+                engine,
+                params={'periodo': periodo},
+            )
+        else:
+            df = pd.read_sql(text(base_select), engine)
+
+        if df is None or df.empty:
+            return pd.DataFrame(columns=cols)
+
+        for col in ['consumo_kwh_real', 'promedio_energia_pura', 'dinero_energia', 'total_factura']:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+        return df[cols]
+    except Exception:
+        return pd.DataFrame(columns=cols)
+
+
 def get_consumidores_por_periodo(periodo):
-    cols = [
-        'tarifa_base',
-        'nro_socio',
-        'nombre_socio',
-        'cantidad_facturas',
-        'consumo_kwh_real',
-        'importe_neto_energia',
-    ]
-    try:
-        if periodo:
-            query = text(
-                """
-                SELECT
-                    COALESCE(NULLIF(TRIM(r.tarifa_base), ''), 'Sin Definir') AS tarifa_base,
-                    r.nro_socio,
-                    COALESCE(NULLIF(TRIM(MAX(s.nombre_socio)), ''), 'Sin Nombre') AS nombre_socio,
-                    COUNT(DISTINCT r.nro_factura) AS cantidad_facturas,
-                    SUM(COALESCE(r.consumo_kwh_real, 0)) AS consumo_kwh_real,
-                    SUM(COALESCE(r.dinero_energia_subdiario, 0)) AS importe_neto_energia
-                FROM conecciones_energia.v_reporte_facturacion_energia r
-                LEFT JOIN conecciones_energia.vista_socios_tarifa_actual s
-                    ON s.nro_socio = r.nro_socio
-                WHERE r.periodo = :periodo
-                GROUP BY
-                    COALESCE(NULLIF(TRIM(r.tarifa_base), ''), 'Sin Definir'),
-                    r.nro_socio
-                """
-            )
-            df_top = pd.read_sql(query, engine, params={'periodo': periodo})
-        else:
-            query = text(
-                """
-                SELECT
-                    COALESCE(NULLIF(TRIM(r.tarifa_base), ''), 'Sin Definir') AS tarifa_base,
-                    r.nro_socio,
-                    COALESCE(NULLIF(TRIM(MAX(s.nombre_socio)), ''), 'Sin Nombre') AS nombre_socio,
-                    COUNT(DISTINCT r.nro_factura) AS cantidad_facturas,
-                    SUM(COALESCE(r.consumo_kwh_real, 0)) AS consumo_kwh_real,
-                    SUM(COALESCE(r.dinero_energia_subdiario, 0)) AS importe_neto_energia
-                FROM conecciones_energia.v_reporte_facturacion_energia r
-                LEFT JOIN conecciones_energia.vista_socios_tarifa_actual s
-                    ON s.nro_socio = r.nro_socio
-                GROUP BY
-                    COALESCE(NULLIF(TRIM(r.tarifa_base), ''), 'Sin Definir'),
-                    r.nro_socio
-                """
-            )
-            df_top = pd.read_sql(query, engine)
-
-        if df_top is None or df_top.empty:
-            return pd.DataFrame(columns=cols)
-
-        df_top = df_top.copy()
-        df_top['cantidad_facturas'] = pd.to_numeric(df_top['cantidad_facturas'], errors='coerce').fillna(0)
-        df_top['consumo_kwh_real'] = pd.to_numeric(df_top['consumo_kwh_real'], errors='coerce').fillna(0.0)
-        df_top['importe_neto_energia'] = pd.to_numeric(df_top['importe_neto_energia'], errors='coerce').fillna(0.0)
-        return df_top[cols]
-    except Exception:
+    """Top 10: agrega por (tarifa_base, nro_socio) reutilizando el cache raw."""
+    cols = ['tarifa_base', 'nro_socio', 'nombre_socio', 'cantidad_facturas',
+            'consumo_kwh_real', 'importe_neto_energia']
+    df = _get_facturas_raw_por_periodo(periodo)
+    if df.empty:
         return pd.DataFrame(columns=cols)
-
-@st.cache_data
-def get_detalle_correlacion_por_periodo(periodo):
-    cols = [
-        'tarifa_base',
-        'categoria_calculada',
-        'nro_socio',
-        'nombre_socio',
-        'nro_factura',
-        'consumo_kwh_real',
-        'importe_energia_pura',
-        'importe_neto_energia',
-        'costo_energia_prom_unitario',
-    ]
-    try:
-        if periodo:
-            query = text(
-                """
-                SELECT
-                    COALESCE(NULLIF(TRIM(r.tarifa_base), ''), 'Sin Definir') AS tarifa_base,
-                    COALESCE(NULLIF(TRIM(r.categoria_calculada), ''), 'Sin Categoría Asignada') AS categoria_calculada,
-                    r.nro_socio,
-                    COALESCE(NULLIF(TRIM(s.nombre_socio), ''), 'Sin Nombre') AS nombre_socio,
-                    r.nro_factura,
-                    COALESCE(r.consumo_kwh_real, 0) AS consumo_kwh_real,
-                    COALESCE(r.importe_energia_pura, 0) AS importe_energia_pura,
-                    COALESCE(r.dinero_energia_subdiario, 0) AS importe_neto_energia
-                FROM conecciones_energia.v_reporte_facturacion_energia r
-                LEFT JOIN (
-                    SELECT nro_socio, MAX(nombre_socio) AS nombre_socio
-                    FROM conecciones_energia.vista_socios_tarifa_actual
-                    GROUP BY nro_socio
-                ) s ON s.nro_socio = r.nro_socio
-                WHERE r.periodo = :periodo
-                """
-            )
-            df_corr = pd.read_sql(query, engine, params={'periodo': periodo})
-        else:
-            query = text(
-                """
-                SELECT
-                    COALESCE(NULLIF(TRIM(r.tarifa_base), ''), 'Sin Definir') AS tarifa_base,
-                    COALESCE(NULLIF(TRIM(r.categoria_calculada), ''), 'Sin Categoría Asignada') AS categoria_calculada,
-                    r.nro_socio,
-                    COALESCE(NULLIF(TRIM(s.nombre_socio), ''), 'Sin Nombre') AS nombre_socio,
-                    r.nro_factura,
-                    COALESCE(r.consumo_kwh_real, 0) AS consumo_kwh_real,
-                    COALESCE(r.importe_energia_pura, 0) AS importe_energia_pura,
-                    COALESCE(r.dinero_energia_subdiario, 0) AS importe_neto_energia
-                FROM conecciones_energia.v_reporte_facturacion_energia r
-                LEFT JOIN (
-                    SELECT nro_socio, MAX(nombre_socio) AS nombre_socio
-                    FROM conecciones_energia.vista_socios_tarifa_actual
-                    GROUP BY nro_socio
-                ) s ON s.nro_socio = r.nro_socio
-                """
-            )
-            df_corr = pd.read_sql(query, engine)
-
-        if df_corr is None or df_corr.empty:
-            return pd.DataFrame(columns=cols)
-
-        df_corr = df_corr.copy()
-        df_corr['consumo_kwh_real'] = pd.to_numeric(df_corr['consumo_kwh_real'], errors='coerce').fillna(0)
-        df_corr['importe_energia_pura'] = pd.to_numeric(df_corr['importe_energia_pura'], errors='coerce').fillna(0)
-        df_corr['importe_neto_energia'] = pd.to_numeric(df_corr['importe_neto_energia'], errors='coerce').fillna(0)
-        df_corr['costo_energia_prom_unitario'] = 0.0
-        mask_consumo = df_corr['consumo_kwh_real'] > 0
-        df_corr.loc[mask_consumo, 'costo_energia_prom_unitario'] = (
-            df_corr.loc[mask_consumo, 'importe_energia_pura'] / df_corr.loc[mask_consumo, 'consumo_kwh_real']
+    agg = (
+        df.groupby(['tarifa_base', 'nro_socio'], as_index=False)
+        .agg(
+            nombre_socio=('nombre_socio', 'first'),
+            cantidad_facturas=('nro_factura', 'nunique'),
+            consumo_kwh_real=('consumo_kwh_real', 'sum'),
+            importe_neto_energia=('dinero_energia', 'sum'),
         )
-        return df_corr[cols]
-    except Exception:
+    )
+    return agg[cols]
+
+
+def get_detalle_correlacion_por_periodo(periodo):
+    """Correlación: una fila por factura con promedio_energia_pura directo de la vista."""
+    cols = [
+        'tarifa_base', 'escalon_asignado',
+        'nro_socio', 'nombre_socio', 'nro_factura',
+        'consumo_kwh_real', 'promedio_energia_pura', 'importe_neto_energia',
+    ]
+    df = _get_facturas_raw_por_periodo(periodo)
+    if df.empty:
         return pd.DataFrame(columns=cols)
+    result = df.rename(columns={'dinero_energia': 'importe_neto_energia'})
+    return result[cols]
 
 @st.cache_data
-def get_facturacion_categoria_por_periodo():
-    cols = ['periodo', 'categoria_calculada', 'total_facturado']
+def get_facturacion_por_tarifa_base_historico():
+    """Totales reales por (periodo, tarifa_base) desde v_consolidado_facturas_final."""
+    cols = ['periodo', 'tarifa_base', 'total_facturado']
     try:
         query = text(
             """
             SELECT
                 periodo,
-                COALESCE(NULLIF(TRIM(categoria_calculada), ''), 'Sin Categoría Asignada') AS categoria_calculada,
+                COALESCE(NULLIF(TRIM(tarifa_base), ''), 'Sin Definir') AS tarifa_base,
                 SUM(COALESCE(total_factura, 0)) AS total_facturado
-            FROM conecciones_energia.v_reporte_facturacion_energia
-            GROUP BY periodo, COALESCE(NULLIF(TRIM(categoria_calculada), ''), 'Sin Categoría Asignada')
+            FROM conecciones_energia.v_consolidado_facturas_final
+            WHERE NOT LOWER(TRIM(tarifa_base)) LIKE 'sin %'
+            GROUP BY periodo, COALESCE(NULLIF(TRIM(tarifa_base), ''), 'Sin Definir')
             ORDER BY periodo ASC, total_facturado DESC
             """
         )
-        df_line = pd.read_sql(query, engine)
-        if df_line is None or df_line.empty:
+        df = pd.read_sql(query, engine)
+        if df is None or df.empty:
             return pd.DataFrame(columns=cols)
-
-        df_line = df_line.copy()
-        df_line['periodo'] = pd.to_datetime(df_line['periodo'], errors='coerce')
-        df_line = df_line.dropna(subset=['periodo'])
-        df_line['total_facturado'] = pd.to_numeric(df_line['total_facturado'], errors='coerce').fillna(0)
-        df_line = df_line[df_line['total_facturado'] > 0]
-        return df_line[cols]
+        df['periodo'] = pd.to_datetime(df['periodo'], errors='coerce')
+        df = df.dropna(subset=['periodo'])
+        df['total_facturado'] = pd.to_numeric(df['total_facturado'], errors='coerce').fillna(0)
+        return df[df['total_facturado'] > 0][cols]
     except Exception:
         return pd.DataFrame(columns=cols)
 
 
-def simular_facturacion_anual_por_categoria(df_base):
-    cols = ['periodo', 'categoria_calculada', 'total_facturado']
+def simular_facturacion_anual_por_tarifa_base(df_base):
+    """Proyecta 12 meses ficticios usando los totales reales del período más reciente como base."""
+    cols = ['periodo', 'tarifa_base', 'total_facturado']
     if df_base is None or df_base.empty:
         return pd.DataFrame(columns=cols)
 
@@ -355,30 +362,29 @@ def simular_facturacion_anual_por_categoria(df_base):
     periodos = pd.date_range(end=end_period, periods=12, freq='MS')
 
     latest_rows = df_work[df_work['periodo'].dt.to_period('M') == end_period.to_period('M')]
-    base_por_categoria = latest_rows.groupby('categoria_calculada', as_index=False)['total_facturado'].sum()
+    base_por_tarifa = latest_rows.groupby('tarifa_base', as_index=False)['total_facturado'].sum()
 
-    if base_por_categoria.empty:
-        base_por_categoria = df_work.groupby('categoria_calculada', as_index=False)['total_facturado'].mean()
+    if base_por_tarifa.empty:
+        base_por_tarifa = df_work.groupby('tarifa_base', as_index=False)['total_facturado'].mean()
 
-    base_por_categoria = base_por_categoria[base_por_categoria['total_facturado'] > 0].copy()
-    base_por_categoria = base_por_categoria.sort_values('total_facturado', ascending=False).reset_index(drop=True)
+    base_por_tarifa = (
+        base_por_tarifa[base_por_tarifa['total_facturado'] > 0]
+        .sort_values('total_facturado', ascending=False)
+        .reset_index(drop=True)
+    )
 
     rows = []
-    for idx, row in base_por_categoria.iterrows():
-        categoria = row['categoria_calculada']
+    for idx, row in base_por_tarifa.iterrows():
+        tarifa = row['tarifa_base']
         base = float(row['total_facturado'])
-
         for month_idx, periodo in enumerate(periodos):
             seasonal = 1 + 0.14 * math.sin((2 * math.pi * (month_idx + idx)) / 12)
             trend = 0.78 + (0.045 * month_idx) + (idx % 3) * 0.02
-            value = max(base * seasonal * trend, 0)
-            rows.append(
-                {
-                    'periodo': periodo,
-                    'categoria_calculada': categoria,
-                    'total_facturado': value,
-                }
-            )
+            rows.append({
+                'periodo': periodo,
+                'tarifa_base': tarifa,
+                'total_facturado': max(base * seasonal * trend, 0),
+            })
 
     return pd.DataFrame(rows, columns=cols)
 
@@ -411,61 +417,71 @@ top_n_tarifas = st.sidebar.number_input(
 
 @st.cache_data
 def get_kpis_por_periodo(periodo):
-    """Devuelve totales por servicio y consumo kWh para el periodo (periodo en 'YYYY-MM-DD')."""
-    # Leer desde la vista que contiene totales por servicio
+    """
+    Devuelve totales de facturación por servicio desde la vista v_kpi_facturacion.
+    Los campos resultantes serán:
+        - total_facturado: suma total (todos los servicios)
+        - importe_neto_energia: suma solo donde nombre_servicio = 'energia'
+        - importe_otros_conceptos: suma donde nombre_servicio <> 'energia'
+        - consumo_kwh_real: suma total de consumo_kwh_real
+    """
+    _df_empty = pd.DataFrame(columns=['nombre_servicio', 'total_facturado', 'consumo_kwh_real'])
+    _zero = {
+        'total_facturado': 0.0,
+        'importe_neto_energia': 0.0,
+        'importe_otros_conceptos': 0.0,
+        'consumo_kwh_real': 0.0,
+        'detalle_servicios': _df_empty,
+    }
     try:
         if periodo:
             query = text(
-                "SELECT periodo, servicio, total_facturado, consumo_kwh_real FROM conecciones_energia.v_kpi_facturacion WHERE periodo = :periodo"
+                """
+                SELECT
+                    nombre_servicio,
+                    COALESCE(total_facturado, 0) AS total_facturado,
+                    COALESCE(consumo_kwh_real, 0) AS consumo_kwh_real
+                FROM conecciones_energia.v_kpi_facturacion
+                WHERE periodo = :periodo
+                """
             )
-            df_serv = pd.read_sql(query, engine, params={"periodo": periodo})
+            df = pd.read_sql(query, engine, params={"periodo": periodo})
         else:
             query = text(
-                "SELECT periodo, servicio, total_facturado, consumo_kwh_real FROM conecciones_energia.v_kpi_facturacion"
+                """
+                SELECT
+                    nombre_servicio,
+                    SUM(COALESCE(total_facturado, 0)) AS total_facturado,
+                    SUM(COALESCE(consumo_kwh_real, 0)) AS consumo_kwh_real
+                FROM conecciones_energia.v_kpi_facturacion
+                GROUP BY nombre_servicio
+                """
             )
-            df_serv = pd.read_sql(query, engine)
-    
-        if df_serv is None or df_serv.empty:
-            df_empty = pd.DataFrame(columns=['servicio', 'total_facturado', 'consumo_kwh_real'])
-            return {
-                'total_facturado': 0.0,
-                'importe_neto_energia': 0.0,
-                'importe_otros_conceptos': 0.0,
-                'consumo_kwh_real': 0.0,
-                'detalle_servicios': df_empty,
-            }
+            df = pd.read_sql(query, engine)
 
-        # Asegurar tipos numéricos
-        df_serv['total_facturado'] = pd.to_numeric(df_serv['total_facturado'], errors='coerce').fillna(0.0)
-        df_serv['consumo_kwh_real'] = pd.to_numeric(df_serv.get('consumo_kwh_real', 0), errors='coerce').fillna(0.0)
+        if df is None or df.empty:
+            return _zero
 
-        total_facturado = float(df_serv['total_facturado'].sum())
+        df['total_facturado']  = pd.to_numeric(df['total_facturado'],  errors='coerce').fillna(0.0)
+        df['consumo_kwh_real'] = pd.to_numeric(df['consumo_kwh_real'], errors='coerce').fillna(0.0)
 
-        mask_energia = df_serv['servicio'].astype(str).str.lower() == 'energia'
-        importe_neto_energia = float(df_serv.loc[mask_energia, 'total_facturado'].sum()) if mask_energia.any() else 0.0
-
-        importe_otros_conceptos = total_facturado - importe_neto_energia
-
-        # Consumo kWh: sumar la columna (normalmente solo 'energia' tendrá valores)
-        consumo_kwh_real = float(df_serv['consumo_kwh_real'].sum())
+        total_facturado = float(df['total_facturado'].sum())
+        try:
+            importe_neto_energia = float(df.loc[df['nombre_servicio'] == 'energia', 'total_facturado'].sum())
+        except Exception:
+            importe_neto_energia = 0.0
+        importe_otros_conceptos = float(df.loc[df['nombre_servicio'] != 'energia', 'total_facturado'].sum())
+        consumo_kwh_real = float(df['consumo_kwh_real'].sum())
 
         return {
             'total_facturado': total_facturado,
             'importe_neto_energia': importe_neto_energia,
             'importe_otros_conceptos': importe_otros_conceptos,
             'consumo_kwh_real': consumo_kwh_real,
-            'detalle_servicios': df_serv,
+            'detalle_servicios': df[['nombre_servicio', 'total_facturado', 'consumo_kwh_real']].copy(),
         }
-    except Exception as e:
-        # En caso de error, devolver ceros y el DataFrame de error como detalle
-        df_err = pd.DataFrame(columns=['servicio', 'total_facturado', 'consumo_kwh_real'])
-        return {
-            'total_facturado': 0.0,
-            'importe_neto_energia': 0.0,
-            'importe_otros_conceptos': 0.0,
-            'consumo_kwh_real': 0.0,
-            'detalle_servicios': df_err,
-        }
+    except Exception:
+        return _zero
 
 # Obtener KPIs desde la base de datos para el periodo seleccionado
 kpis = get_kpis_por_periodo(periodo_sql)
@@ -487,24 +503,27 @@ st.markdown(
 
 # 6. Gráfico de Anillo
 
-df_totalizado_tarifa = get_totalizado_por_tarifa_base(periodo_sql)
+df_totalizado_tarifa = get_facturacion_por_tarifa_base(periodo_sql)
+df_escalon = get_facturacion_por_escalon(periodo_sql)
 
-# Preparar datos para el gráfico de anillo.
-# Priorizar los totales por servicio recibidos en los KPIs (vista v_kpi_facturacion).
+# Preparar datos para el gráfico de anillo (Gráfico 2: segmentación por grupos de servicio).
 df_kpi_serv = kpis.get('detalle_servicios', pd.DataFrame())
-if not df_kpi_serv.empty and 'servicio' in df_kpi_serv.columns and 'total_facturado' in df_kpi_serv.columns:
-    df_kpi = df_kpi_serv.copy()
-    df_kpi['total_facturado'] = pd.to_numeric(df_kpi['total_facturado'], errors='coerce').fillna(0.0)
-    df_kpi = df_kpi.sort_values(by='total_facturado', ascending=False)
-    if len(df_kpi) > top_n_tarifas:
-        top = df_kpi.head(top_n_tarifas)
-        otros = pd.DataFrame({
-            'servicio': ['Otros'],
-            'total_facturado': [df_kpi.iloc[top_n_tarifas:]['total_facturado'].sum()]
+if not df_kpi_serv.empty:
+    df_kpi_serv = df_kpi_serv[df_kpi_serv['total_facturado'] > 0].sort_values(
+        by='total_facturado', ascending=False
+    )
+    if len(df_kpi_serv) > top_n_tarifas:
+        top_serv = df_kpi_serv.head(top_n_tarifas)
+        otros_serv = pd.DataFrame({
+            'nombre_servicio': ['Otros'],
+            'total_facturado': [df_kpi_serv.iloc[top_n_tarifas:]['total_facturado'].sum()],
         })
-        df_tarifa_procesado = pd.concat([top, otros], ignore_index=True).rename(columns={'servicio': 'tarifa_base'})[['tarifa_base', 'total_facturado']]
+        df_serv_donut = pd.concat([top_serv, otros_serv], ignore_index=True)
     else:
-        df_tarifa_procesado = df_kpi.rename(columns={'servicio': 'tarifa_base'})[['tarifa_base', 'total_facturado']]
+        df_serv_donut = df_kpi_serv.copy()
+    df_tarifa_procesado = df_serv_donut[['nombre_servicio', 'total_facturado']].rename(
+        columns={'nombre_servicio': 'tarifa_base'}
+    )
 else:
     df_tarifa_procesado = pd.DataFrame(columns=['tarifa_base', 'total_facturado'])
 
@@ -680,26 +699,28 @@ if not df_tarifa_procesado.empty:
     """
     
     with left_col:
-        st.markdown("#### Distr. de Fact. por Grupos")
+        st.markdown("#### Distr. de Fact. por Servicios")
         components.html(donut_html, height=500, scrolling=False)
     with right_col:
         st.markdown("#### Distr. de Fact. por Tarifa Base")
-        df_tarifa_base = df_totalizado_tarifa
+        df_tarifa_torta = df_totalizado_tarifa.copy() if not df_totalizado_tarifa.empty else pd.DataFrame(columns=['tarifa_base', 'total_facturado'])
 
-        if not df_tarifa_base.empty:
-            df_tarifa_base = df_tarifa_base.copy()
-            df_tarifa_base['label'] = df_tarifa_base['tarifa_base'].apply(normalize_label)
+        if not df_tarifa_torta.empty:
+            df_tarifa_torta = df_tarifa_torta[df_tarifa_torta['total_facturado'] > 0].sort_values(
+                by='total_facturado', ascending=False
+            )
+            df_tarifa_torta['label'] = df_tarifa_torta['tarifa_base'].apply(normalize_label)
 
-            if len(df_tarifa_base) > top_n_tarifas:
-                top_tarifa = df_tarifa_base.head(top_n_tarifas)
-                otros_tarifa = pd.DataFrame({
+            if len(df_tarifa_torta) > top_n_tarifas:
+                top_tb = df_tarifa_torta.head(top_n_tarifas)
+                otros_tb = pd.DataFrame({
                     'tarifa_base': ['Otros'],
-                    'total_facturado': [df_tarifa_base.iloc[top_n_tarifas:]['total_facturado'].sum()],
+                    'total_facturado': [df_tarifa_torta.iloc[top_n_tarifas:]['total_facturado'].sum()],
                     'label': ['Otros'],
                 })
-                df_torta_tarifa = pd.concat([top_tarifa, otros_tarifa], ignore_index=True)
+                df_torta_tarifa = pd.concat([top_tb, otros_tb], ignore_index=True)
             else:
-                df_torta_tarifa = df_tarifa_base
+                df_torta_tarifa = df_tarifa_torta
 
             pie_palette = px.colors.qualitative.Set3
             pie_slice_colors = [pie_palette[index % len(pie_palette)] for index in range(len(df_torta_tarifa))]
@@ -866,7 +887,7 @@ if not df_tarifa_procesado.empty:
 
             components.html(pie_html, height=500, scrolling=False)
         else:
-            st.info("No hay datos de tarifa base para el período seleccionado.")
+            st.info("No hay datos de escalón asignado para el período seleccionado.")
 else:
     st.warning("No hay datos disponibles para mostrar el gráfico.")
 
@@ -954,12 +975,12 @@ if not df_consumidores_corr.empty:
         st.session_state['corr_segmentar_por_tarifa_base'] = False
 
     usar_tarifa_base = st.session_state['corr_segmentar_por_tarifa_base']
-    etiqueta_segmentacion = 'Tarifa Base' if usar_tarifa_base else 'Tarifa Calculada'
-    campo_segmentacion = 'tarifa_base' if usar_tarifa_base else 'categoria_calculada'
-    valor_sin_asignar = 'Sin Definir' if usar_tarifa_base else 'Sin Categoría Asignada'
+    etiqueta_segmentacion = 'Tarifa Base' if usar_tarifa_base else 'Escalón Asignado'
+    campo_segmentacion = 'tarifa_base' if usar_tarifa_base else 'escalon_asignado'
+    valor_sin_asignar = 'Sin Definir' if usar_tarifa_base else 'Sin Escalón'
 
     boton_segmentacion = (
-        "Cambiar a Tarifa Calculada" if usar_tarifa_base else "Cambiar a Tarifa Base"
+        "Cambiar a Escalón Asignado" if usar_tarifa_base else "Cambiar a Tarifa Base"
     )
     if st.button(boton_segmentacion, key='corr_toggle_segmentacion'):
         st.session_state['corr_segmentar_por_tarifa_base'] = not usar_tarifa_base
@@ -978,12 +999,22 @@ if not df_consumidores_corr.empty:
             .sort_values(ascending=False)
             .index.tolist()
         )
-    if valor_sin_asignar in categorias_corr:
-        categorias_corr = [c for c in categorias_corr if c != valor_sin_asignar] + [valor_sin_asignar]
+    categorias_corr = [c for c in categorias_corr if not str(c).lower().startswith('sin ')]
 
+    _defaults_corr = {
+        'tarifa_base':      'Residencial c/Subs < 500',
+        'escalon_asignado': 'Residencial c/Subs < 500',
+    }
+    _default_corr = _defaults_corr.get(campo_segmentacion, '')
+    _default_corr_idx = (
+        categorias_corr.index(_default_corr)
+        if _default_corr in categorias_corr
+        else 0
+    )
     categoria_corr_sel = st.selectbox(
         f"{etiqueta_segmentacion}:",
         options=categorias_corr,
+        index=_default_corr_idx,
         key=f"corr_categoria_{campo_segmentacion}",
     )
 
@@ -996,7 +1027,7 @@ if not df_consumidores_corr.empty:
         )
         df_corr = df_corr[
             (df_corr['consumo_kwh_real'] > 0)
-            & (df_corr['costo_energia_prom_unitario'] > 0)
+            & (df_corr['promedio_energia_pura'] > 0)
         ].copy()
 
         if not df_corr.empty:
@@ -1004,17 +1035,17 @@ if not df_consumidores_corr.empty:
             fig_corr = px.scatter(
                 df_corr,
                 x='consumo_kwh_real',
-                y='costo_energia_prom_unitario',
+                y='promedio_energia_pura',
                 hover_name='consumidor',
                 custom_data=[
                     'importe_neto_energia',
                     'nro_factura',
                     campo_segmentacion,
-                    'costo_energia_prom_unitario',
+                    'promedio_energia_pura',
                 ],
                 labels={
                     'consumo_kwh_real': 'Consumo kWh Real',
-                    'costo_energia_prom_unitario': 'Costo Energía Prom. Unitario',
+                    'promedio_energia_pura': 'Promedio Energía Pura ($/kWh)',
                 },
             )
             fig_corr.update_traces(
@@ -1024,20 +1055,20 @@ if not df_consumidores_corr.empty:
                     f'{etiqueta_segmentacion}: %{{customdata[2]}}<br>'
                     'Nro Factura: %{customdata[1]}<br>'
                     'Consumo: %{x:,.0f} kWh<br>'
-                    'Costo Energía Prom. Unitario: $%{customdata[3]:,.2f}<br>'
+                    'Promedio Energía Pura: $%{customdata[3]:,.2f}<br>'
                     'Importe Neto Energía: $%{customdata[0]:,.0f}<extra></extra>'
                 ),
             )
             fig_corr.update_layout(
                 margin=dict(t=10, b=0, l=0, r=0),
                 xaxis_title='Consumo kWh Real',
-                yaxis_title='Costo Energía Prom. Unitario ($/kWh)',
+                yaxis_title='Promedio Energía Pura ($/kWh)',
                 showlegend=False,
             )
             st.plotly_chart(fig_corr, width='stretch')
         else:
             st.info(
-                f"No hay datos con consumo/costo unitario > 0 para calcular la correlación en la {etiqueta_segmentacion.lower()} seleccionada."
+                f"No hay datos con consumo/promedio > 0 para calcular la correlación en la {etiqueta_segmentacion.lower()} seleccionada."
             )
     else:
         st.info(f"Seleccione una {etiqueta_segmentacion.lower()} para ver la correlación.")
@@ -1049,19 +1080,11 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.subheader("Line Race: Evolución de Facturación por Categoría")
+st.subheader("Line Race: Evolución de Facturación por Tarifa Base")
 
-df_line_race_real = get_facturacion_categoria_por_periodo()
-simular_line_race = st.checkbox(
-    "Simular 12 períodos (demo anual)",
-    value=False,
-    key='line_race_simular_12',
+df_line_race = simular_facturacion_anual_por_tarifa_base(
+    get_facturacion_por_tarifa_base_historico()
 )
-
-if simular_line_race and not df_line_race_real.empty:
-    df_line_race = simular_facturacion_anual_por_categoria(df_line_race_real)
-else:
-    df_line_race = df_line_race_real
 
 if not df_line_race.empty:
     df_line_race = df_line_race.copy()
@@ -1073,12 +1096,11 @@ if not df_line_race.empty:
         .sort_values('periodo')
     )
     period_options = periodos_line['periodo_display'].tolist()
-    default_periods = period_options[-2:] if len(period_options) >= 2 else period_options
 
     periodos_sel = st.multiselect(
         "Períodos para line race:",
         options=period_options,
-        default=default_periods,
+        default=period_options,
         key='line_race_periodos',
     )
 
@@ -1088,14 +1110,14 @@ if not df_line_race.empty:
         df_line_plot['periodo_display'] = pd.Categorical(df_line_plot['periodo_display'], categories=period_order, ordered=True)
 
         top_categorias_line = (
-            df_line_plot.groupby('categoria_calculada', as_index=False)['total_facturado']
+            df_line_plot.groupby('tarifa_base', as_index=False)['total_facturado']
             .sum()
             .sort_values('total_facturado', ascending=False)
-            .head(int(top_n_tarifas))['categoria_calculada']
+            .head(int(top_n_tarifas))['tarifa_base']
             .tolist()
         )
-        df_line_plot = df_line_plot[df_line_plot['categoria_calculada'].isin(top_categorias_line)].copy()
-        df_line_plot = df_line_plot.sort_values(['periodo', 'categoria_calculada'])
+        df_line_plot = df_line_plot[df_line_plot['tarifa_base'].isin(top_categorias_line)].copy()
+        df_line_plot = df_line_plot.sort_values(['periodo', 'tarifa_base'])
 
         period_dates = (
             df_line_plot[['periodo', 'periodo_display']]
@@ -1127,7 +1149,7 @@ if not df_line_race.empty:
         series_by_categoria = {}
         for categoria in top_categorias_line:
             serie = (
-                df_line_plot[df_line_plot['categoria_calculada'] == categoria][['periodo', 'total_facturado']]
+                df_line_plot[df_line_plot['tarifa_base'] == categoria][['periodo', 'total_facturado']]
                 .set_index('periodo')
                 .reindex(period_values)
                 .fillna(0)
@@ -1215,7 +1237,7 @@ if not df_line_race.empty:
                 dtick='M1',
                 fixedrange=True,
             ),
-            legend_title_text='Categoría',
+            legend_title_text='Tarifa Base',
             updatemenus=[
                 {
                     'type': 'buttons',
@@ -1274,10 +1296,7 @@ if not df_line_race.empty:
             ],
         )
 
-        if simular_line_race:
-            st.caption("Visualización animada con datos simulados para 12 períodos (demo anual).")
-        else:
-            st.caption("Use ▶ Play para ver cómo se va dibujando la evolución mensual por categoría.")
+        st.caption("Datos simulados para 12 períodos (demo anual). Use ▶ Play para ver la evolución mensual por tarifa base.")
         st.plotly_chart(fig_line_race, width='stretch')
     else:
         st.info("Seleccione al menos un período para visualizar el line race.")

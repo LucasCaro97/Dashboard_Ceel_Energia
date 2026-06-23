@@ -96,10 +96,29 @@ def inyectar_a_mysql(df, table_name):
         return False
 
 
+_QUERY_MAESTRO_CONCEPTOS = """
+    SELECT
+        cm.id_concepto,
+        cm.nombre_concepto,
+        cm.es_consumo_total,
+        cm.grupo_usuario,
+        LOWER(REPLACE(s.nombre_servicio, ' ', '_')) AS servicio,
+        cm.es_consumo_escalonado
+    FROM conceptos_maestro cm
+    JOIN servicios s ON s.id_servicio = CAST(cm.servicio AS UNSIGNED)
+    WHERE s.activo = 1
+"""
+
+
 def obtener_maestro_conceptos():
     """
-    Gets the Conceptos_Maestro table from the database.
-    
+    Gets the conceptos_maestro table joined with servicios.
+
+    conceptos_maestro.servicio stores the id_servicio (FK as varchar).
+    The join resolves that ID to nombre_servicio and normalizes it to
+    lowercase-with-underscores so it matches the service prefix extracted
+    from TXT filenames (e.g. "Facturas Adicionales" -> "facturas_adicionales").
+
     Returns:
         pd.DataFrame: Master concepts table, or None if error
     """
@@ -108,8 +127,7 @@ def obtener_maestro_conceptos():
 
         if 'db_url' in db_config:
             engine = build_sqlalchemy_engine(db_config)
-            query = "SELECT * FROM Conceptos_Maestro"
-            df_maestro = pd.read_sql(query, engine)
+            df_maestro = pd.read_sql(_QUERY_MAESTRO_CONCEPTOS, engine)
             print("Connected to database using SQLAlchemy (DB_URL).")
             return df_maestro
 
@@ -121,9 +139,8 @@ def obtener_maestro_conceptos():
             port=db_config['port'],
         )
         print("Connected to database using pymysql.")
-        
-        query = "SELECT * FROM Conceptos_Maestro"
-        df_maestro = pd.read_sql(query, conn)
+
+        df_maestro = pd.read_sql(_QUERY_MAESTRO_CONCEPTOS, conn)
         conn.close()
         return df_maestro
     except Exception as e:

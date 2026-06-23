@@ -1,4 +1,4 @@
-"""Pipeline mensual de sincronizacion de socios de Energia desde TRYLOGYC."""
+"""Pipeline mensual de sincronizacion de socios de Internet desde TRYLOGYC."""
 
 from __future__ import annotations
 
@@ -21,13 +21,14 @@ from .config import (
     TABLA_MEDIDORES,
     TABLA_TARIFAS,
     TABLA_TARIFA_BASE,
+    TIENE_MEDIDORES,
     TARIFA_EQUIVALENCIAS,
 )
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-DEFAULT_INPUT = ROOT / "data" / "energia" / "socios" / "socios_normalizados.csv"
+DEFAULT_INPUT = ROOT / "data" / "internet" / "socios" / "socios_normalizados.csv"
 
-ENERGIA_CONFIG = SectorSyncConfig(
+INTERNET_CONFIG = SectorSyncConfig(
     servicio_objetivo=SERVICIO_TIPO,
     db_schema=DB_SCHEMA,
     tabla_socios=TABLA_SOCIOS,
@@ -35,7 +36,8 @@ ENERGIA_CONFIG = SectorSyncConfig(
     tabla_tarifas=TABLA_TARIFAS,
     tabla_tarifa_base=TABLA_TARIFA_BASE,
     tarifa_equivalencias=TARIFA_EQUIVALENCIAS,
-    reportes_dir=ROOT / "data" / "energia" / "reportes_sincro",
+    reportes_dir=ROOT / "data" / "internet" / "reportes_sincro",
+    tiene_medidores=TIENE_MEDIDORES,
 )
 
 
@@ -44,27 +46,27 @@ def ejecutar_sync(
     dry_run: bool,
     export_reportes_csv_flag: bool,
 ) -> SyncSummary:
-    """Sincroniza socios/medidores/tarifas del sector Energia."""
+    """Sincroniza socios/medidores/tarifas del sector Internet."""
     return ejecutar_sync_sector(
         input_path=input_path,
         dry_run=dry_run,
         export_reportes_csv_flag=export_reportes_csv_flag,
-        config=ENERGIA_CONFIG,
+        config=INTERNET_CONFIG,
     )
 
 
 def print_summary(summary: SyncSummary) -> None:
-    print_summary_sector(summary, ENERGIA_CONFIG)
+    print_summary_sector(summary, INTERNET_CONFIG)
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Sincroniza socios/medidores/tarifas de Energia."
+        description="Sincroniza socios/medidores/tarifas de Internet."
     )
     parser.add_argument(
         "--input",
         default=str(DEFAULT_INPUT),
-        help="Ruta del CSV normalizado (default: data/energia/socios/socios_normalizados.csv).",
+        help="Ruta del CSV normalizado (default: data/internet/socios/socios_normalizados.csv).",
     )
     parser.add_argument(
         "--dry-run",
@@ -74,7 +76,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--export-reportes-csv",
         action="store_true",
-        help="Genera CSVs de control en data/energia/reportes_sincro/.",
+        help="Genera CSVs de control en data/internet/reportes_sincro/.",
     )
     return parser.parse_args()
 
