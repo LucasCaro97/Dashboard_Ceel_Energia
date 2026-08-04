@@ -22,11 +22,12 @@ except ImportError:
     load_dotenv = None
 
 # 1. Configuración de página
-st.set_page_config(page_title="Dashboard Internet - CEEL", layout="wide")
+st.set_page_config(page_title="Dashboard Television - CEEL", layout="wide")
 
 # 2. Constantes
 TOP_N_TARIFAS_DEFAULT = 6
-SERVICIO_TIPO  = "internet"
+SERVICIO_TIPO = "television"
+SERVICIO_SOCIOS = "Television"
 
 # 3. Motor de conexión
 if load_dotenv is not None:
@@ -70,57 +71,69 @@ def to_periodo_sql(value):
 
 @st.cache_data
 def get_periodos_disponibles():
-    return fetch_periodos_disponibles(engine)
-
-
-@st.cache_data
-def get_kpi_por_sector_sp(periodo):
-    """KPIs del período desde sp_kpi_por_sector(sector, periodo)."""
-    if not periodo:
-        return None
     try:
-        with engine.connect() as conn:
-            result = conn.execute(
-                text("CALL sp_kpi_por_sector(:sector, :periodo)"),
-                {"sector": SERVICIO_TIPO, "periodo": periodo},
-            )
-            rows = result.fetchall()
-            cols = list(result.keys())
-        if not rows:
-            return None
-        return dict(zip(cols, rows[0]))
+        query = text(
+            """
+            SELECT periodo
+            FROM conecciones_energia.facturacion_conceptos
+            WHERE periodo IS NOT NULL
+              AND servicio = :servicio
+            GROUP BY periodo
+            ORDER BY periodo DESC
+            """
+        )
+        df_periodos = pd.read_sql(query, engine, params={"servicio": SERVICIO_TIPO})
+        if df_periodos is None or df_periodos.empty:
+            return []
+        periodos = pd.to_datetime(df_periodos["periodo"], errors="coerce").dropna()
+        return periodos.dt.strftime("%Y-%m-%d").tolist()
     except Exception:
-        return None
+        return fetch_periodos_disponibles(engine)
 
 
 @st.cache_data
-def get_total_facturado_sp(periodo):
-    """Total facturado para el período, obtenido desde sp_kpi_por_sector."""
-    kpi = get_kpi_por_sector_sp(periodo)
-    if not kpi:
+def get_total_facturado(periodo):
+    """Total facturado del período para Television."""
+    if not periodo:
         return 0.0
-    val = pd.to_numeric(kpi.get("total_facturado"), errors="coerce")
-    return float(val) if pd.notna(val) else 0.0
+    try:
+        df = pd.read_sql(
+            text(
+                """
+                SELECT COALESCE(SUM(total), 0) AS total_facturado
+                FROM conecciones_energia.facturacion_conceptos
+                WHERE periodo = :periodo
+                  AND servicio = :servicio
+                """
+            ),
+            engine,
+            params={"periodo": periodo, "servicio": SERVICIO_TIPO},
+        )
+        val = pd.to_numeric(df.iloc[0]["total_facturado"], errors="coerce")
+        return float(val) if pd.notna(val) else 0.0
+    except Exception:
+        return 0.0
 
 
 @st.cache_data
 def get_cantidad_facturas(periodo):
-    """Cantidad de facturas: prioriza sp_kpi_por_sector, fallback fn_contar_facturas_internet."""
+    """Cantidad de facturas emitidas en el período."""
     if not periodo:
         return 0
-    kpi = get_kpi_por_sector_sp(periodo)
-    if kpi and kpi.get("cantidad_facturas") is not None:
-        val = pd.to_numeric(kpi.get("cantidad_facturas"), errors="coerce")
-        if pd.notna(val):
-            return int(val)
     try:
         df = pd.read_sql(
-            text("SELECT fn_contar_facturas_internet(:periodo) AS total_facturas"),
+            text(
+                """
+                SELECT COUNT(DISTINCT nro_factura) AS total_facturas
+                FROM conecciones_energia.facturacion_conceptos
+                WHERE periodo = :periodo
+                  AND servicio = :servicio
+                  AND COALESCE(nro_factura, '') <> ''
+                """
+            ),
             engine,
-            params={"periodo": periodo},
+            params={"periodo": periodo, "servicio": SERVICIO_TIPO},
         )
-        if df is None or df.empty:
-            return 0
         val = pd.to_numeric(df.iloc[0]["total_facturas"], errors="coerce")
         return int(val) if pd.notna(val) else 0
     except Exception:
@@ -128,8 +141,54 @@ def get_cantidad_facturas(periodo):
 
 
 @st.cache_data
+def get_conceptos_servicio_nombres():
+    """
+    Conceptos de television marcados como servicio (es_consumo_total=1).
+    Excluye impuestos, IVA, percepciones y conceptos accesorios.
+    """
+    try:
+        df = pd.read_sql(
+            text(
+                """
+                SELECT cm.nombre_concepto
+                FROM conecciones_energia.conceptos_maestro cm
+                JOIN conecciones_energia.servicios s
+                  ON s.id_servicio = CAST(cm.servicio AS UNSIGNED)
+                WHERE LOWER(s.nombre_servicio) = :sector
+                  AND cm.es_consumo_total = 1
+                """
+            ),
+            engine,
+            params={"sector": SERVICIO_TIPO},
+        )
+        if df is None or df.empty:
+            return frozenset()
+        nombres = (
+            df["nombre_concepto"]
+            .astype(str)
+            .str.strip()
+            .replace("", pd.NA)
+            .dropna()
+            .tolist()
+        )
+        return frozenset(nombres)
+    except Exception:
+        return frozenset()
+
+
+def _filtrar_conceptos_servicio(df):
+    """Conserva solo conceptos de servicio (es_consumo_total=1)."""
+    if df is None or df.empty or "nombre_concepto" not in df.columns:
+        return df
+    allowed = get_conceptos_servicio_nombres()
+    if not allowed:
+        return df.iloc[0:0].copy()
+    return df[df["nombre_concepto"].isin(allowed)].copy()
+
+
+@st.cache_data
 def get_ranking_servicios_por_periodo(periodo):
-    """Ranking de servicios facturados por período desde sp_ranking_servicios_por_periodo."""
+    """Ranking de conceptos de servicio facturados por período (sin impuestos)."""
     cols = ["nombre_concepto", "cantidad", "total"]
     if not periodo:
         return pd.DataFrame(columns=cols)
@@ -151,6 +210,7 @@ def get_ranking_servicios_por_periodo(periodo):
         )
         df["cantidad"] = pd.to_numeric(df["cantidad"], errors="coerce").fillna(0).astype(int)
         df["total"] = pd.to_numeric(df["total"], errors="coerce").fillna(0.0)
+        df = _filtrar_conceptos_servicio(df)
         return df[df["total"] > 0].sort_values("total", ascending=False).reset_index(drop=True)[cols]
     except Exception:
         return pd.DataFrame(columns=cols)
@@ -158,7 +218,7 @@ def get_ranking_servicios_por_periodo(periodo):
 
 @st.cache_data
 def get_ranking_servicios_historico(periodos):
-    """Cantidad de usuarios por servicio para cada período (vía SP)."""
+    """Cantidad de usuarios por concepto de servicio para cada período."""
     cols = ["periodo", "nombre_concepto", "cantidad"]
     if not periodos:
         return pd.DataFrame(columns=cols)
@@ -178,7 +238,7 @@ def get_ranking_servicios_historico(periodos):
 
 
 def _prepare_usuarios_pivot(df_hist, top_n):
-    """Prepara pivot de cantidad por período y servicio."""
+    """Prepara pivot de cantidad por período y concepto de servicio."""
     if df_hist is None or df_hist.empty:
         return None
 
@@ -388,14 +448,14 @@ def _sync_usuarios_kpi_servicios(legend_names):
 
 @st.cache_data
 def get_facturacion_por_tarifa(periodo):
-    """Facturación por tarifa desde sp_consolidado_internet_por_periodo."""
+    """Facturación por tarifa desde sp_consolidado_television_por_periodo."""
     cols = ["tarifa_aplicada", "total_facturado", "cantidad_socios"]
     if not periodo:
         return pd.DataFrame(columns=cols)
     try:
         with engine.connect() as conn:
             result = conn.execute(
-                text("CALL sp_consolidado_internet_por_periodo(:periodo)"),
+                text("CALL sp_consolidado_television_por_periodo(:periodo)"),
                 {"periodo": periodo},
             )
             rows = result.fetchall()
@@ -630,7 +690,7 @@ def _build_interactive_pie_html(df_values, label_col, value_col, palette, chart_
 # ─── 6. Interfaz ──────────────────────────────────────────────────────────────
 
 st.markdown(
-    "<h3 style='margin-bottom:0;'>🌐 Dashboard de Facturación - CEEL INTERNET</h3>",
+    "<h3 style='margin-bottom:0;'>📺 Dashboard de Facturación - CEEL TELEVISION</h3>",
     unsafe_allow_html=True,
 )
 
@@ -652,7 +712,7 @@ top_n_tarifas = st.sidebar.number_input(
 )
 
 # ── KPIs ──────────────────────────────────────────────────────────────────────
-total_facturado = get_total_facturado_sp(periodo_sql)
+total_facturado = get_total_facturado(periodo_sql)
 cantidad_facturas = get_cantidad_facturas(periodo_sql)
 
 col1, col2 = st.columns(2)
@@ -682,7 +742,7 @@ with left_col:
 
         html_pie = _build_interactive_pie_html(
             df_chart, "tarifa_aplicada", "total_facturado",
-            px.colors.qualitative.Set3, "pie-inet", hole=0.45,
+            px.colors.qualitative.Pastel, "pie-tv", hole=0.45,
         )
         components.html(html_pie, height=500, scrolling=False)
     else:
@@ -693,10 +753,14 @@ with right_col:
     if not df_servicios.empty:
         df_bars = df_servicios.copy()
         if len(df_bars) > top_n_tarifas:
-            top_part  = df_bars.head(top_n_tarifas)
+            top_part = df_bars.head(top_n_tarifas)
             otros_val = df_bars.iloc[top_n_tarifas:]["total"].sum()
             otros_cant = df_bars.iloc[top_n_tarifas:]["cantidad"].sum()
-            otros_row = pd.DataFrame({"nombre_concepto": ["Otros"], "total": [otros_val], "cantidad": [otros_cant]})
+            otros_row = pd.DataFrame({
+                "nombre_concepto": ["Otros"],
+                "total": [otros_val],
+                "cantidad": [otros_cant],
+            })
             df_bars = pd.concat([top_part, otros_row], ignore_index=True)
 
         df_bars = df_bars.sort_values("total", ascending=False).copy()
@@ -711,7 +775,7 @@ with right_col:
             y="total",
             text="total",
             color="nombre_concepto",
-            color_discrete_sequence=px.colors.qualitative.Set3,
+            color_discrete_sequence=px.colors.qualitative.Pastel,
             custom_data=["cantidad"],
         )
         fig_bars.update_traces(

@@ -4,9 +4,14 @@ Configuracion especifica del sector Gas.
 """
 
 SERVICIO_TIPO = "Gas"
+
+# Prefijo en archivos TXT (gas_<id>.txt) -> clave servicio en conceptos_maestro.
+SERVICIO_TXT_ALIASES = {
+    "gas": "gas_envasado",
+}
 DB_SCHEMA = "conecciones_energia"
 TABLA_FACTURACION = "facturacion_conceptos"
-TABLA_SOCIOS = "socios_gas"
+TABLA_SOCIOS = "socios_energia"
 TABLA_MEDIDORES = "socios_medidores"
 TABLA_TARIFAS = "socio_historial_tarifas"
 TABLA_TARIFA_BASE = "tarifas_base"

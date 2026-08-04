@@ -14,7 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from core.normalizar_base import normalizar as _normalizar_base, archivo_mas_reciente
-from .config import SERVICIO_TIPO
+from .config import SERVICIO_ALIASES, SERVICIO_TIPO
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 CARPETA_SOCIOS = ROOT / "data" / "television" / "socios"
@@ -36,6 +36,7 @@ def normalizar(ruta_csv, ruta_salida=SALIDA_DEFAULT):
         ruta_csv=ruta_csv,
         ruta_salida=ruta_salida,
         servicio_tipo=SERVICIO_TIPO,
+        servicio_aliases=SERVICIO_ALIASES,
     )
 
 

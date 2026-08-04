@@ -133,7 +133,16 @@ Mismo flujo para cualquier otro sector (--sector agua, --sector gas, etc.).
 ================================================================================
 
   .\venv\Scripts\activate
+
+  # App unica con tabs por sector implementado
+  streamlit run dashboards\sector_tabs.py
+
+  # Dashboards individuales
   streamlit run dashboards\energia_dashboard.py
+  streamlit run dashboards\internet_dashboard.py
+  streamlit run dashboards\television_dashboard.py
+  python scripts\cargar_vista_consolidado_gas.py
+  streamlit run dashboards\gas_dashboard.py
 
 Abre en http://localhost:8501  (solo lectura, no modifica la BD).
 
@@ -184,6 +193,8 @@ automatizacion_ceel/
     sincronizar.py         Wrapper CLI -> BD (socios/medidores/tarifas)
   dashboards/
     energia_dashboard.py   Streamlit
+    internet_dashboard.py  Streamlit
+    television_dashboard.py Streamlit
   data/
     <sector>/
       inbox/<AAAA>/<MM>/   TXT conceptos (entrada procesar.py)

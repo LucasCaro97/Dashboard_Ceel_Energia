@@ -72,7 +72,12 @@ def _fecha_desde_nombre(path: Path):
     return None
 
 
-def normalizar(ruta_csv: Path, ruta_salida: Path, servicio_tipo: str = None) -> pd.DataFrame:
+def normalizar(
+    ruta_csv: Path,
+    ruta_salida: Path,
+    servicio_tipo: str = None,
+    servicio_aliases: dict = None,
+) -> pd.DataFrame:
     """
     Normaliza un CSV de socios exportado desde TRYLOGYC.
 
@@ -84,6 +89,8 @@ def normalizar(ruta_csv: Path, ruta_salida: Path, servicio_tipo: str = None) -> 
         ruta_csv: Ruta del CSV crudo de TRYLOGYC.
         ruta_salida: Ruta donde guardar el CSV normalizado.
         servicio_tipo: Nombre del servicio a reportar en el resumen (opcional).
+        servicio_aliases: Mapeo opcional TRYLOGYC -> nombre canonico en columna
+            ``servicio`` (ej. {"TV Cable": "Television"}).
 
     Returns:
         pd.DataFrame con los registros normalizados (todos los servicios).
@@ -122,6 +129,9 @@ def normalizar(ruta_csv: Path, ruta_salida: Path, servicio_tipo: str = None) -> 
     fecha_fuente = _fecha_desde_nombre(ruta_csv)
     df["fecha_fuente"] = fecha_fuente
     print(f"  Fecha del archivo: {fecha_fuente}")
+
+    if servicio_aliases:
+        df["servicio"] = df["servicio"].replace(servicio_aliases)
 
     df = df[[
         "nro_socio",

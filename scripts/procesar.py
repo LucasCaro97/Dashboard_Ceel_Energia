@@ -15,6 +15,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from sectors.energia.procesador import procesar_facturacion
 from sectors.internet.procesador import procesar_facturacion as procesar_facturacion_internet
+from sectors.television.procesador import procesar_facturacion as procesar_facturacion_television
+from sectors.gas.procesador import procesar_facturacion as procesar_facturacion_gas
 
 
 SECTORES_DISPONIBLES = ["energia", "agua", "internet", "television", "gas"]
@@ -53,6 +55,12 @@ def main():
         sys.exit(0 if success else 1)
     elif args.sector == "internet":
         success = procesar_facturacion_internet(args.año, args.mes, sector="internet", dry_run=args.dry_run)
+        sys.exit(0 if success else 1)
+    elif args.sector == "television":
+        success = procesar_facturacion_television(args.año, args.mes, sector="television", dry_run=args.dry_run)
+        sys.exit(0 if success else 1)
+    elif args.sector == "gas":
+        success = procesar_facturacion_gas(args.año, args.mes, sector="gas", dry_run=args.dry_run)
         sys.exit(0 if success else 1)
     else:
         print(f"Sector '{args.sector}' aún no implementado")
