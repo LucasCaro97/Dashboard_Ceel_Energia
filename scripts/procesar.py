@@ -17,6 +17,7 @@ from sectors.energia.procesador import procesar_facturacion
 from sectors.internet.procesador import procesar_facturacion as procesar_facturacion_internet
 from sectors.television.procesador import procesar_facturacion as procesar_facturacion_television
 from sectors.gas.procesador import procesar_facturacion as procesar_facturacion_gas
+from sectors.agua.procesador import procesar_facturacion as procesar_facturacion_agua
 
 
 SECTORES_DISPONIBLES = ["energia", "agua", "internet", "television", "gas"]
@@ -61,6 +62,9 @@ def main():
         sys.exit(0 if success else 1)
     elif args.sector == "gas":
         success = procesar_facturacion_gas(args.año, args.mes, sector="gas", dry_run=args.dry_run)
+        sys.exit(0 if success else 1)
+    elif args.sector == "agua":
+        success = procesar_facturacion_agua(args.año, args.mes, sector="agua", dry_run=args.dry_run)
         sys.exit(0 if success else 1)
     else:
         print(f"Sector '{args.sector}' aún no implementado")

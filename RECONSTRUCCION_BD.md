@@ -102,6 +102,17 @@ SELECT COUNT(*) FROM socio_historial_tarifas
 - Vistas del dashboard (`v_kpi_facturacion`, etc.)
 - Precios reales en `escalones_tarifa.precio` (hoy placeholder 0)
 
+### SPs dashboard Energía (versionados)
+
+```powershell
+.\venv\Scripts\python.exe scripts\cargar_sp_energia.py
+```
+
+Archivo: `data/energia/sql/sp_energia_dashboard.sql`
+
+Incluye `sp_kpi_facturacion_por_tarifa`, `sp_consolidado_facturas_por_periodo` y
+`sp_kpi_por_sector`. Los dos primeros filtran solo `id_servicio = 1` (Energía).
+
 ---
 
 ## Referencia rapida de archivos

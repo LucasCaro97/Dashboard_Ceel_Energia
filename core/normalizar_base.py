@@ -167,10 +167,21 @@ def normalizar(
 
 
 def archivo_mas_reciente(carpeta: Path) -> Path:
-    """Devuelve el lista_socios_*.csv mas reciente en la carpeta indicada."""
-    candidatos = sorted(carpeta.glob("lista_socios_*.csv"), reverse=True)
+    """Devuelve el lista_socios_*.csv mas reciente segun la fecha del nombre.
+
+    El nombre usa formato DDMMAAAA (ej. lista_socios_06082026.csv = 2026-08-06).
+    No se ordena por string del filename: lexicograficamente ``18062026``
+    (18/06) gana a ``06082026`` (06/08), aunque sea mas viejo.
+    """
+    candidatos = list(carpeta.glob("lista_socios_*.csv"))
     if not candidatos:
         raise FileNotFoundError(
             f"No se encontro ningun lista_socios_*.csv en {carpeta}"
         )
-    return candidatos[0]
+
+    def _clave_recencia(path: Path):
+        fecha = _fecha_desde_nombre(path)
+        # Fecha ISO primero; si no parsea, cae a mtime del archivo.
+        return (fecha or "", path.stat().st_mtime)
+
+    return max(candidatos, key=_clave_recencia)

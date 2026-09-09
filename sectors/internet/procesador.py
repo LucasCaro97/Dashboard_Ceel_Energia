@@ -19,6 +19,7 @@ from core.db_manager import (
     inyectar_a_mysql,
     obtener_maestro_conceptos,
 )
+from core.dry_run_report import imprimir_resumen_dry_run
 from .config import TABLA_FACTURACION, SERVICIO_TIPO
 
 
@@ -126,6 +127,10 @@ def procesar_facturacion(anio, mes, sector="internet", dry_run=False):
         "Importe":     "importe",
         "Total":       "total",
     })
+
+    if dry_run:
+        imprimir_resumen_dry_run(df_final, anio, mes, TABLA_FACTURACION)
+
     df_final = df_final.drop(
         columns=["nombre_concepto", "es_consumo_total", "grupo_usuario",
                  "es_consumo_escalonado", "Direccion"],
@@ -140,16 +145,6 @@ def procesar_facturacion(anio, mes, sector="internet", dry_run=False):
     print(f"File generated: {nombre_archivo}")
 
     if dry_run:
-        print("\n--- DRY RUN SUMMARY (nothing was written to the database) ---")
-        print(f"  Periodo         : {anio}-{mes}")
-        print(f"  Filas totales   : {len(df_final):,}")
-        print(f"  Socios unicos   : {df_final['nro_socio'].nunique():,}")
-        print(f"  Conceptos únicos: {df_final['id_concepto'].nunique():,}")
-        print(f"  Total importe   : {df_final['importe'].sum():,.2f}")
-        print(f"  Total general   : {df_final['total'].sum():,.2f}")
-        print(f"  Tabla destino   : {TABLA_FACTURACION}")
-        print("-------------------------------------------------------------")
-        print("--- DRY RUN OK: run without --dry-run to inject into DB ---")
         return True
 
     if inyectar_a_mysql(df_final, TABLA_FACTURACION):

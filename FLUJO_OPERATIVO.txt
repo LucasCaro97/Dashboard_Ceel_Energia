@@ -1,0 +1,211 @@
+================================================================================
+  CRONOGRAMA OPERATIVO MENSUAL — AUTOMATIZACION CEEL
+================================================================================
+
+Objetivo: que tarifas base y conceptos facturados queden alineados al mismo
+periodo (01/MM/AAAA) y el dashboard no muestre "Sin Definir" por fechas.
+
+Ancla conocida:
+  Emision TRYLOGYC anterior = 29/07/2026  →  periodo 07/2026
+  Proxima emision esperada  ≈ 28~29/08/2026 → periodo 08/2026
+
+
+--------------------------------------------------------------------------------
+REGLAS FIJAS (no negociables)
+--------------------------------------------------------------------------------
+
+1. ORDEN SIEMPRE:
+     Socios (normalizar + sincronizar)  →  luego  →  Conceptos (procesar)
+
+2. El CSV de socios del mes MM debe llamarse:
+     lista_socios_DDMMAAAA.csv
+   con fecha DENTRO del mes MM (ej. periodo 08/2026 → cualquier dia 01..31/08).
+   Motivo: el sync abre vigencia el dia 01/MM de esa fecha_fuente.
+
+3. Los TXT de conceptos van a:
+     data/<sector>/inbox/<AAAA>/<MM>/
+   y se procesan con --año AAAA --mes MM (mismo periodo).
+
+4. NUNCA reprocesar el mismo periodo de conceptos sin limpiar antes
+   (procesar.py hace append y duplica).
+
+5. Un solo snapshot de socios por mes de facturacion (ideal).
+   Si hay correccion el mismo mes: re-sincronizar socios; las vigencias
+   del mes se ajustan al 01/MM.
+
+6. Sectores a cubrir en el mismo ciclo (cuando haya datos):
+     energia | agua | gas | internet | television
+
+
+--------------------------------------------------------------------------------
+VENTANA MENSUAL TIPO (anclada a dia de emision D ≈ 29)
+--------------------------------------------------------------------------------
+
+  Dia   | Que pasa                         | Quien / accion
+  ------+----------------------------------+------------------------------------
+  D-2   | Periodo MM casi cerrado          | Verificar que no falten altas/
+        | en TRYLOGYC                      | cambios de tarifa en TRYLOGYC
+  D     | EMISION facturas periodo MM      | TRYLOGYC emite (ej. 29/07 → 07/2026)
+  D     | Export listo                     | Exportar desde TRYLOGYC el mismo
+        |                                  | dia o a primera hora del dia
+        |                                  | siguiente (ver checklist abajo)
+  D+0/1 | Depositar archivos               | Copiar a data/ segun rutas
+  D+1   | SOCIOS                           | normalizar + sync dry-run + revisar
+  D+1/2 | SOCIOS confirmado                | sync real
+  D+2   | CONCEPTOS                        | procesar dry-run + real
+  D+2/3 | CONTROL                          | Dashboard: Sin Definir, totales,
+        |                                  | top consumidores
+  D+3   | CIERRE DEL CICLO MM              | Archivar reportes_sincro del mes
+
+
+--------------------------------------------------------------------------------
+EJEMPLO CONCRETO — PERIODO 08/2026
+--------------------------------------------------------------------------------
+
+Supuesto: emision TRYLOGYC ≈ viernes 28/08/2026 o sabado 29/08/2026
+          (mismo patron que 29/07 para 07/2026).
+
+  Fecha        | Paso | Accion estricta
+  -------------+------+------------------------------------------------------------
+  26~27/08     | 0    | Chequeo previo en TRYLOGYC: tarifas/socios del mes OK
+  28~29/08     | 1    | EMISION periodo 08/2026 en TRYLOGYC
+  28~29/08     | 2    | EXPORTAR:
+               |      |   - TXT conceptos → data/<sector>/inbox/2026/08/
+               |      |   - CSV socios   → data/<sector>/socios/lista_socios_DD082026.csv
+               |      |     (DD = dia real del export, debe ser agosto)
+  29~30/08     | 3    | Por cada sector con datos:
+               |      |   python scripts/normalizar.py --sector <sector>
+               |      |   python scripts/sincronizar.py --sector <sector> --dry-run --export-reportes-csv
+               |      |   Revisar reportes en data/<sector>/reportes_sincro/
+               |      |   python scripts/sincronizar.py --sector <sector> --export-reportes-csv
+               |      |   Esperado en log: Vigencia desde: 2026-08-01
+  30~31/08     | 4    | Por cada sector:
+               |      |   python scripts/procesar.py --sector <sector> --año 2026 --mes 08 --dry-run
+               |      |   python scripts/procesar.py --sector <sector> --año 2026 --mes 08
+  31/08~01/09  | 5    | Dashboard (reiniciar Streamlit / limpiar cache):
+               |      |   streamlit run dashboards/sector_tabs.py
+               |      |   Validar periodo 08/2026: %% Sin Definir, totales, torta tarifas
+
+
+--------------------------------------------------------------------------------
+EJEMPLO CONCRETO — PERIODO 09/2026 (siguiente ciclo)
+--------------------------------------------------------------------------------
+
+  Emision esperada ≈ 28~29/09/2026 → periodo 09/2026
+
+  26~27/09  Pre-chequeo TRYLOGYC
+  28~29/09  Emision + export (lista_socios_DD092026.csv + inbox/2026/09/)
+  29~30/09  Normalizar + sincronizar socios (vigencia desde 2026-09-01)
+  30/09~01/10  Procesar conceptos --mes 09
+  01~02/10  Control dashboard periodo 09/2026
+
+
+--------------------------------------------------------------------------------
+CHECKLIST POR CICLO (copiar y marcar)
+--------------------------------------------------------------------------------
+
+Periodo: ____ / ______     Emision TRYLOGYC: ____ / ____ / ______
+
+[ ] 1. Export TXT conceptos → data/<sector>/inbox/<AAAA>/<MM>/
+[ ] 2. Export CSV socios   → data/<sector>/socios/lista_socios_DDMMAAAA.csv
+       (fecha del nombre dentro del mes MM del periodo)
+[ ] 3. normalizar.py --sector <sector>
+[ ] 4. sincronizar.py --dry-run --export-reportes-csv
+[ ] 5. Revisar reportes (no_mapeadas, cambiadas, creadas)
+[ ] 6. sincronizar.py --export-reportes-csv
+       Log OK si dice: Vigencia desde: <AAAA>-<MM>-01
+[ ] 7. procesar.py --año AAAA --mes MM --dry-run
+[ ] 8. procesar.py --año AAAA --mes MM
+[ ] 9. Dashboard periodo MM: Sin Definir en rango aceptable / totales OK
+[ ] 10. Guardar esta checklist + carpeta reportes_sincro del ciclo
+
+
+--------------------------------------------------------------------------------
+QUE ARCHIVO CORRESPONDE A QUE PERIODO
+--------------------------------------------------------------------------------
+
+  Periodo facturado | inbox                  | lista_socios (fecha en nombre)
+  ------------------+------------------------+--------------------------------
+  07/2026           | .../inbox/2026/07/     | lista_socios_??072026.csv
+  08/2026           | .../inbox/2026/08/     | lista_socios_??082026.csv
+  09/2026           | .../inbox/2026/09/     | lista_socios_??092026.csv
+
+  Si el CSV tiene fecha de otro mes (ej. 06/08 para querer arreglar julio),
+  la vigencia se abre el 01/08, NO el 01/07.
+  Para atribucion correcta de un periodo, el snapshot de socios debe ser
+  de ese mismo mes.
+
+
+--------------------------------------------------------------------------------
+RECUPERACION SI YA SE CARGO MAL
+--------------------------------------------------------------------------------
+
+Caso A — Socios sincronizados a mitad de mes (vigencia 05/08 o 06/08)
+  → Re-ejecutar sincronizar del mismo CSV de agosto.
+     El sync actual backdatea al 01/08.
+
+Caso B — Conceptos ya inyectados dos veces
+  → NO volver a procesar. Limpiar duplicados en BD antes de reinyectar.
+
+Caso C — Quedo "Sin Definir" en periodo MM
+  → Verificar: (1) hubo sync de socios del mes MM, (2) vigencia desde 01/MM,
+    (3) tarifas mapeadas (tarifas_no_mapeadas.csv vacio o revisado),
+    (4) cache Streamlit reiniciada.
+
+
+--------------------------------------------------------------------------------
+CALENDARIO ANUAL DE REFERENCIA 2026 (emision ≈ dia 29)
+--------------------------------------------------------------------------------
+
+  Periodo | Emision est. | Carga CEEL (socios→conceptos) | Control dashboard
+  --------+--------------+-------------------------------+-------------------
+  07/2026 | 29/07/2026   | 29~31/07                      | 31/07~01/08
+  08/2026 | 28~29/08     | 29~31/08                      | 31/08~01/09
+  09/2026 | 28~29/09     | 29~30/09 ~ 01/10              | 01~02/10
+  10/2026 | 28~29/10     | 29~31/10                      | 31/10~01/11
+  11/2026 | 27~28/11*    | 28~30/11                      | 30/11~01/12
+  12/2026 | 29~30/12     | 30/12 ~ 02/01                 | 02~03/01/2027
+
+  * Ajustar si el 29 cae feriado/finde: mover D al dia habil de emision real
+    de TRYLOGYC; el resto del cronograma se corre en bloque (D, D+1, D+2).
+
+
+--------------------------------------------------------------------------------
+CARGA HISTORICA SIN SNAPSHOTS DE SOCIOS (ej. Agua — corte agosto 2026)
+--------------------------------------------------------------------------------
+
+Cuando NO existen listas de socios de meses anteriores (solo un CSV reciente),
+se acepta este criterio:
+
+  - Meses ANTERIORES al corte: cargar SOLO conceptos (facturacion).
+    No habra tarifa base atribuida en consolidado/dashboard ("Sin Definir").
+    Los totales facturados SI quedan en facturacion_conceptos.
+
+  - A partir del corte (primer mes con sync de socios): socios → conceptos
+    en orden normal; el matcheo de tarifas funciona desde periodo = 01/MM
+    de ese mes.
+
+Corte Agua Potable acordado: agosto 2026
+  Unico CSV disponible: lista_socios_13082026.csv
+  Vigencia tarifas en BD: desde 2026-08-01
+
+  FASE 1 — Cerrar historico (julio y meses previos), SIN tarifa:
+    [ ] cargar_conceptos_agua.py (una vez)
+    [ ] procesar.py --sector agua --año AAAA --mes MM  (por cada mes pendiente)
+    [ ] NO sincronizar socios antes de estos meses (no ayudaria al matcheo)
+
+  FASE 2 — Arranque con tarifas desde agosto 2026:
+    [ ] normalizar.py --sector agua --input data\agua\socios\lista_socios_13082026.csv
+    [ ] sincronizar.py --sector agua --dry-run --export-reportes-csv
+    [ ] sincronizar.py --sector agua --export-reportes-csv
+        Log esperado: Vigencia desde: 2026-08-01
+    [ ] procesar.py --sector agua --año 2026 --mes 08  (cuando existan TXT 08/)
+    [ ] Dashboard periodo 08/2026: validar distribucion por tarifa base
+
+  Nota: julio 2026 procesado con inbox/2026/07/ queda con facturacion OK pero
+  sin tarifa historica. Eso es esperado, no es error del pipeline.
+
+
+================================================================================
+Fin del documento — seguir este archivo mes a mes; no inventar otro orden.
+================================================================================

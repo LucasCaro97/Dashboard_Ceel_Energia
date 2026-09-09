@@ -39,12 +39,20 @@ IMPLEMENTED_DASHBOARDS = [
         "icon": "🔥",
         "path": ROOT / "gas_dashboard.py",
     },
+    {
+        "slug": "agua",
+        "label": "Agua",
+        "icon": "💧",
+        "path": ROOT / "agua_dashboard.py",
+    },
 ]
 
 
 SESSION_STATE_KEYS = [
+    "usuarios_area_chart",
     "usuarios_kpi_servicios",
     "_usuarios_legend_key",
+    "_usuarios_legend_selected",
     "corr_segmentar_por_tarifa_base",
 ]
 
@@ -130,10 +138,52 @@ def _render_dashboard_script(path: Path, slug: str) -> None:
 def main() -> None:
     st.set_page_config(page_title="Dashboards CEEL", layout="wide")
     st.markdown(
-        "<h2 style='margin-bottom:0;'>Dashboards de Facturación CEEL</h2>",
+        """
+        <style>
+            html {
+                scrollbar-gutter: stable;
+            }
+            [data-testid="stMainBlockContainer"] {
+                padding-top: 0.35rem;
+                padding-left: 1.25rem;
+                padding-right: 1.25rem;
+                max-width: 100%;
+            }
+            [data-testid="stHtml"] iframe {
+                display: block !important;
+                width: 100% !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                border: 0 !important;
+                overflow: hidden !important;
+            }
+            [data-testid="stVerticalBlock"] {
+                gap: 0.5rem;
+            }
+            div[data-testid="column"] {
+                padding-left: 0.6rem;
+                padding-right: 0.6rem;
+            }
+            [data-testid="stHorizontalBlock"] {
+                gap: 0.75rem;
+            }
+            [data-testid="stTabs"] {
+                margin-bottom: 0.15rem;
+            }
+            [data-testid="stTabs"] [data-baseweb="tab-list"] {
+                gap: 0.35rem;
+            }
+            iframe[title="streamlit_echarts.st_echarts"] {
+                width: 100% !important;
+            }
+        </style>
+        """,
         unsafe_allow_html=True,
     )
-    st.caption("Seleccione el sector desde las pestañas. Solo se muestran sectores implementados.")
+    st.markdown(
+        "<h2 style='margin:0 0 0.35rem 0;font-size:1.25rem;line-height:1.2;'>Dashboards de Facturación CEEL</h2>",
+        unsafe_allow_html=True,
+    )
 
     dashboards = [item for item in IMPLEMENTED_DASHBOARDS if item["path"].exists()]
     tabs = st.tabs([f"{item['icon']} {item['label']}" for item in dashboards])

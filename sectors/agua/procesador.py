@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Processor for Gas (GAS ENVASADO) billing.
-Injects billing concept data from TXT into the database.
+Processor for Agua Potable billing.
+Injects billing concept data from TRYLOGYC TXT into the database.
 """
 
 import glob
@@ -24,12 +24,62 @@ from core.dry_run_report import imprimir_resumen_dry_run
 from .config import SERVICIO_TXT_ALIASES, TABLA_FACTURACION
 
 
+def _parsear_numero_locale(valor) -> float:
+    """Convierte importes TRYLOGYC (coma decimal) sin romper floats ya parseados."""
+    if pd.isna(valor):
+        return 0.0
+    if isinstance(valor, (int, float)) and not isinstance(valor, bool):
+        return round(float(valor), 2)
+    texto = str(valor).strip()
+    if not texto or texto.lower() == "nan":
+        return 0.0
+    if "," in texto:
+        texto = texto.replace(".", "").replace(",", ".")
+    return round(float(pd.to_numeric(texto, errors="coerce") or 0), 2)
+
+
+def _extraer_columnas_facturacion(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    TRYLOGYC agua puede exportar 10 o 12 columnas.
+    En el formato largo hay dos pares Cantidad/Importe antes de TOTAL;
+    se usa el par con datos (ej. CF vacío + Cap con importe).
+    """
+    df = df.drop(df.columns[0], axis=1)
+    socio = df.iloc[:, :5].copy()
+    socio.columns = [
+        "Socio_Con",
+        "Nombre",
+        "Direccion",
+        "Nro_Factura",
+        "Socio",
+    ]
+
+    rest_cols = [c for c in df.columns[5:] if not str(c).startswith("Unnamed")]
+    rest = df[rest_cols]
+    total_col = rest_cols[-1]
+    pair_cols = rest_cols[:-1]
+
+    pairs = [
+        (pair_cols[i], pair_cols[i + 1])
+        for i in range(0, len(pair_cols), 2)
+        if i + 1 < len(pair_cols)
+    ]
+    if not pairs:
+        raise ValueError(
+            f"Formato TXT agua inválido: columnas de facturación insuficientes ({rest_cols})"
+        )
+
+    cant_col, imp_col = max(pairs, key=lambda p: rest[p[1]].notna().sum())
+
+    out = socio.copy()
+    out["Cantidad"] = rest[cant_col]
+    out["Importe"] = rest[imp_col]
+    out["Total"] = rest[total_col]
+    return out
+
+
 def _mapear_servicio_real(servicio_norm: str) -> str:
-    """
-    Mapea el servicio normalizado (ej: gas_envasado) al nombre exacto
-    en la tabla `servicios` (ej: 'GAS ENVASADO'), para que los JOINs por
-    nombre funcionen en MySQL.
-    """
+    """TXT agua_* -> nombre exacto en tabla servicios (Agua Potable)."""
     try:
         engine = build_sqlalchemy_engine(get_db_config())
         with engine.connect() as conn:
@@ -51,11 +101,8 @@ def _mapear_servicio_real(servicio_norm: str) -> str:
     return servicio_norm
 
 
-def procesar_periodo(anio, mes, sector="gas"):
-    """
-    Reads TXT billing files for a specific period and normalizes them.
-    TXT naming: <servicio>_<id_concepto>.txt (e.g. gas_1.txt)
-    """
+def procesar_periodo(anio, mes, sector="agua"):
+    """Reads TXT billing files for a specific period (agua_<id>.txt)."""
     ruta_periodo = f"./data/{sector}/inbox/{anio}/{mes}"
     archivos = glob.glob(os.path.join(ruta_periodo, "**", "*.txt"), recursive=True)
 
@@ -67,17 +114,7 @@ def procesar_periodo(anio, mes, sector="gas"):
     for archivo in archivos:
         print(f"Processing: {os.path.basename(archivo)}")
         df = pd.read_csv(archivo, sep=";", encoding="latin1")
-        df = df.drop(df.columns[0], axis=1).iloc[:, 0:8]
-        df.columns = [
-            "Socio_Con",
-            "Nombre",
-            "Direccion",
-            "Nro_Factura",
-            "Socio",
-            "Cantidad",
-            "Importe",
-            "Total",
-        ]
+        df = _extraer_columnas_facturacion(df)
         df = df.dropna(how="all")
 
         nombre_base = os.path.basename(archivo).replace(".txt", "")
@@ -92,16 +129,16 @@ def procesar_periodo(anio, mes, sector="gas"):
     return pd.concat(dataframes, ignore_index=True)
 
 
-def procesar_facturacion(anio, mes, sector="gas", dry_run=False):
+def procesar_facturacion(anio, mes, sector="agua", dry_run=False):
     """
-    Complete billing processing pipeline for Gas:
-    1. Reads TXTs from data/gas/inbox/{anio}/{mes}/
-    2. Validates against master concepts
+    Complete billing processing pipeline for Agua:
+    1. Reads TXTs from data/agua/inbox/{anio}/{mes}/
+    2. Validates against master concepts (servicio=Agua Potable, id_servicio=2)
     3. Injects into facturacion_conceptos (skipped in dry_run)
-    4. Generates control Excel in data/gas/processed/{anio}/{mes}/
+    4. Generates control Excel in data/agua/processed/{anio}/{mes}/
     """
     modo = "[DRY RUN] " if dry_run else ""
-    print(f"--- {modo}Starting Gas billing processing ---")
+    print(f"--- {modo}Starting Agua billing processing ---")
 
     df_final = procesar_periodo(anio, mes, sector)
     if df_final is None:
@@ -116,13 +153,7 @@ def procesar_facturacion(anio, mes, sector="gas", dry_run=False):
     print("Database connected and master loaded.")
 
     for col in ["Importe", "Total", "Cantidad"]:
-        df_final[col] = (
-            df_final[col]
-            .astype(str)
-            .str.replace(".", "", regex=False)
-            .str.replace(",", ".", regex=False)
-        )
-        df_final[col] = pd.to_numeric(df_final[col], errors="coerce").fillna(0).round(2)
+        df_final[col] = df_final[col].apply(_parsear_numero_locale)
 
     df_final = pd.merge(df_final, df_maestro, on=["servicio", "id_concepto"], how="left")
 
@@ -134,6 +165,7 @@ def procesar_facturacion(anio, mes, sector="gas", dry_run=False):
         print("\n--- ERROR: CONCEPTS NOT FOUND IN MASTER! ---")
         print("The following concepts are in files but NOT in database:")
         print(faltantes)
+        print("Run: python scripts/cargar_conceptos_agua.py")
         print("-------------------------------------------------------\n")
         return False
 
@@ -163,8 +195,6 @@ def procesar_facturacion(anio, mes, sector="gas", dry_run=False):
         errors="ignore",
     )
 
-    # En la tabla facturacion_conceptos, `servicio` debe coincidir con `servicios.nombre_servicio`
-    # para que los JOINs en SQL/SP funcionen.
     if not df_final.empty and "servicio" in df_final.columns:
         servicio_norm = str(df_final["servicio"].iloc[0]).strip()
         df_final["servicio"] = _mapear_servicio_real(servicio_norm)
@@ -172,7 +202,9 @@ def procesar_facturacion(anio, mes, sector="gas", dry_run=False):
     ruta_salida = f"./data/{sector}/processed/{anio}/{mes}"
     os.makedirs(ruta_salida, exist_ok=True)
     sufijo = "_dry_run" if dry_run else ""
-    nombre_archivo = f"{ruta_salida}/{sector.upper()}_conceptos_facturados_{anio}_{mes}{sufijo}.xlsx"
+    nombre_archivo = (
+        f"{ruta_salida}/AGUA_conceptos_facturados_{anio}_{mes}{sufijo}.xlsx"
+    )
     df_final.to_excel(nombre_archivo, index=False)
     print(f"File generated: {nombre_archivo}")
 
@@ -189,7 +221,7 @@ def procesar_facturacion(anio, mes, sector="gas", dry_run=False):
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Procesa facturacion Gas (GAS ENVASADO).")
+    parser = argparse.ArgumentParser(description="Procesa facturacion Agua Potable.")
     parser.add_argument("--año", required=True)
     parser.add_argument("--mes", required=True)
     parser.add_argument(
@@ -199,4 +231,3 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     procesar_facturacion(args.año, args.mes, dry_run=args.dry_run)
-

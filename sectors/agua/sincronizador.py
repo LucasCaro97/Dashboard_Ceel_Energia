@@ -16,6 +16,7 @@ from core.sector_sync import (
 )
 from .config import (
     DB_SCHEMA,
+    ID_SERVICIO,
     SERVICIO_TIPO,
     TABLA_SOCIOS,
     TABLA_MEDIDORES,
@@ -36,6 +37,7 @@ AGUA_CONFIG = SectorSyncConfig(
     tabla_tarifa_base=TABLA_TARIFA_BASE,
     tarifa_equivalencias=TARIFA_EQUIVALENCIAS,
     reportes_dir=ROOT / "data" / "agua" / "reportes_sincro",
+    id_servicio=int(ID_SERVICIO),
 )
 
 

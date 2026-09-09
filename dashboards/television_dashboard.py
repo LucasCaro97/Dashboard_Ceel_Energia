@@ -10,6 +10,8 @@ import json
 import os
 
 from common.periods import fetch_periodos_disponibles
+from common.empty_state import NO_RECORDS_MESSAGE, sin_datos_periodo
+from common.evolucion_facturado import build_evolucion_total_fig, fetch_totales_por_periodos
 
 try:
     from streamlit_echarts import st_echarts
@@ -26,6 +28,13 @@ st.set_page_config(page_title="Dashboard Television - CEEL", layout="wide")
 
 # 2. Constantes
 TOP_N_TARIFAS_DEFAULT = 6
+MESES_EVOLUCION_DEFAULT = 6
+MESES_EVOLUCION_MIN = 2
+MESES_EVOLUCION_MAX = 12
+DIST_CHART_HEIGHT = 360
+PIE_DOMAIN_X = (0.0, 0.58)
+PIE_DOMAIN_Y = (0.02, 0.98)
+PIE_CENTER_X = (PIE_DOMAIN_X[0] + PIE_DOMAIN_X[1]) / 2
 SERVICIO_TIPO = "television"
 SERVICIO_SOCIOS = "Television"
 
@@ -65,6 +74,26 @@ def to_periodo_sql(value):
     if len(text_value) == 10 and text_value[4] == "-" and text_value[7] == "-":
         return text_value
     return pd.to_datetime(text_value, dayfirst=True).strftime("%Y-%m-%d")
+
+
+def get_periodos_evolucion(periodos, periodo_fin, cantidad_meses):
+    """Devuelve los últimos N períodos disponibles hasta el período seleccionado."""
+    if not periodos:
+        return []
+
+    periodo_fin_ts = pd.to_datetime(periodo_fin, errors="coerce")
+    periodos_dt = (
+        pd.Series(periodos)
+        .map(lambda p: pd.to_datetime(to_periodo_sql(p), errors="coerce"))
+        .dropna()
+        .drop_duplicates()
+        .sort_values()
+    )
+
+    if pd.notna(periodo_fin_ts):
+        periodos_dt = periodos_dt[periodos_dt <= periodo_fin_ts]
+
+    return [p.strftime("%Y-%m-%d") for p in periodos_dt.tail(int(cantidad_meses))]
 
 
 # 5. Funciones de carga (todas cacheadas)
@@ -341,14 +370,14 @@ def _build_usuarios_area_options(pivot, periodos, stack_order, legend_data, lege
     legends, legend_height = _build_wrapped_legends(legend_data, legend_selected)
 
     return {
-        "title": {"text": "Usuarios por Servicio"},
+        "title": {"text": "Usuarios por Servicio", "left": "center", "top": 4, "textStyle": {"fontSize": 14}},
         "tooltip": {
             "trigger": "axis",
             "axisPointer": {"type": "cross", "label": {"backgroundColor": "#6a7985"}},
         },
         "legend": legends,
         "toolbox": {"feature": {"saveAsImage": {}}},
-        "grid": {"left": "3%", "right": "4%", "bottom": legend_height, "containLabel": True},
+        "grid": {"left": 16, "right": 12, "top": 40, "bottom": legend_height, "containLabel": True},
         "xAxis": [
             {
                 "type": "category",
@@ -367,7 +396,7 @@ def _calc_usuarios_kpis(pivot, selected_map):
         return None
 
     if selected_map:
-        cols = [c for c in pivot.columns if selected_map.get(c, True)]
+        cols = [name for name in pivot.columns if selected_map.get(name, True)]
     else:
         cols = pivot.columns.tolist()
 
@@ -427,23 +456,45 @@ def _extract_legend_selected(raw, legend_names):
     if not isinstance(payload, dict):
         return None
 
+    if isinstance(payload.get("selected"), dict):
+        payload = payload["selected"]
+
     legend_set = set(legend_names)
-    if not legend_set & set(payload.keys()):
+    matched = legend_set & set(payload.keys())
+    if not matched:
         return None
 
-    return {name: bool(payload.get(name, True)) for name in legend_names}
+    return {name: bool(payload[name]) for name in matched}
 
 
-def _sync_usuarios_kpi_servicios(legend_names):
-    """Sincroniza el filtro de KPIs desde el estado del gráfico (leyenda)."""
-    selected = _extract_legend_selected(
-        st.session_state.get("usuarios_area_chart"),
-        legend_names,
-    )
-    if selected:
-        st.session_state.usuarios_kpi_servicios = [
-            name for name, active in selected.items() if active
-        ]
+def _init_legend_selection(legend_names):
+    """Inicializa el mapa de selección de leyenda para la configuración actual."""
+    legend_key = tuple(legend_names)
+    if st.session_state.get("_usuarios_legend_key") != legend_key:
+        st.session_state._usuarios_legend_key = legend_key
+        st.session_state._usuarios_legend_selected = {name: True for name in legend_names}
+        st.session_state.usuarios_kpi_servicios = list(legend_names)
+
+
+def _apply_legend_selection(legend_names, raw_chart_state=None):
+    """Aplica la selección de leyenda desde el estado previo del gráfico."""
+    _init_legend_selection(legend_names)
+
+    partial = _extract_legend_selected(raw_chart_state, legend_names)
+    if partial:
+        selected_map = dict(st.session_state._usuarios_legend_selected)
+        selected_map.update(partial)
+        st.session_state._usuarios_legend_selected = selected_map
+
+    selected_map = {
+        name: bool(st.session_state._usuarios_legend_selected.get(name, True))
+        for name in legend_names
+    }
+    st.session_state._usuarios_legend_selected = selected_map
+    st.session_state.usuarios_kpi_servicios = [
+        name for name, active in selected_map.items() if active
+    ]
+    return selected_map
 
 
 @st.cache_data
@@ -487,7 +538,7 @@ def get_facturacion_por_tarifa(periodo):
 
 # ─── Utilidad: gráfico de torta/donut interactivo ─────────────────────────────
 
-def _build_interactive_pie_html(df_values, label_col, value_col, palette, chart_id, hole=0.45):
+def _build_interactive_pie_html(df_values, label_col, value_col, palette, chart_id, hole=0.45, height=DIST_CHART_HEIGHT):
     """Genera el HTML de un pie/donut Plotly interactivo con leyenda sincronizada."""
     df_plot = df_values.copy()
     df_plot["label"] = df_plot[label_col].astype(str)
@@ -511,10 +562,14 @@ def _build_interactive_pie_html(df_values, label_col, value_col, palette, chart_
         textfont=dict(size=12),
         hoverinfo="none",
         hovertemplate="<extra></extra>",
+        domain=dict(x=list(PIE_DOMAIN_X), y=list(PIE_DOMAIN_Y)),
     )
     fig.update_layout(
         showlegend=False,
         hovermode="closest",
+        width=800,
+        height=height,
+        autosize=False,
         margin=dict(t=0, b=0, l=0, r=0),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
@@ -539,9 +594,30 @@ def _build_interactive_pie_html(df_values, label_col, value_col, palette, chart_
 
     return fr"""
     <style>
-        html,body{{margin:0;padding:0;background:transparent;overflow:hidden;}}
-        .{wrap_cls}{{position:relative;width:100%;}}
-        #{chart_div}{{width:100%;background:transparent;}}
+        html,body{{
+            margin:0;
+            padding:0;
+            background:transparent;
+            overflow:hidden;
+            box-sizing:border-box;
+        }}
+        *,*::before,*::after{{box-sizing:border-box;}}
+        .{wrap_cls}{{
+            position:relative;
+            width:100%;
+            height:{height}px;
+            overflow:hidden;
+        }}
+        #{chart_div}{{
+            width:100%;
+            height:{height}px;
+            max-width:100%;
+            background:transparent;
+            overflow:hidden;
+        }}
+        #{chart_div} .main-svg{{
+            display:block;
+        }}
         #{chart_div} .hoverlayer,
         #{chart_div} .hovertext{{
             display:none !important;
@@ -575,11 +651,13 @@ def _build_interactive_pie_html(df_values, label_col, value_col, palette, chart_
         .{chart_area}{{
             position:relative;
             width:100%;
+            height:{height}px;
+            overflow:hidden;
         }}
         #{center_div}{{
             position:absolute;
             top:50%;
-            left:50%;
+            left:{PIE_CENTER_X * 100:.2f}%;
             transform:translate(-50%, -50%);
             z-index:20;
             pointer-events:none;
@@ -609,7 +687,7 @@ def _build_interactive_pie_html(df_values, label_col, value_col, palette, chart_
         <div id="{leg_div}">{legend_items}</div>
         <div class="{chart_area}">
             <div id="{center_div}"></div>
-            <div id="{chart_div}" style="min-height:420px;"></div>
+            <div id="{chart_div}"></div>
         </div>
     </div>
     <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
@@ -619,11 +697,29 @@ def _build_interactive_pie_html(df_values, label_col, value_col, palette, chart_
             const baseColors = {colors_json};
             const percents = {percents_json};
             const chart = document.getElementById('{chart_div}');
+            const wrap = document.querySelector('.{wrap_cls}');
             const centerEl = document.getElementById('{center_div}');
             const legendItems = Array.from(document.querySelectorAll('#{leg_div} .legend-item'));
             const baseTextSize = (fig.data[0].textfont && fig.data[0].textfont.size) ? fig.data[0].textfont.size : 13;
             const hoverTextSize = baseTextSize + 3;
             const basePull = (fig.data[0].labels || []).map(() => 0);
+            let resizeTimer = null;
+
+            function resizeChart() {{
+                if (!chart || !wrap || !chart.isConnected) return;
+                const width = Math.floor(wrap.clientWidth);
+                const height = Math.floor(wrap.clientHeight);
+                if (width <= 0 || height <= 0) return;
+                Plotly.relayout(chart, {{ width: width, height: height }});
+            }}
+
+            function scheduleResize() {{
+                if (resizeTimer) clearTimeout(resizeTimer);
+                resizeTimer = setTimeout(() => {{
+                    resizeChart();
+                    requestAnimationFrame(resizeChart);
+                }}, 16);
+            }}
 
             function updateCenter(idx) {{
                 if (idx === null || idx === undefined) {{
@@ -673,7 +769,7 @@ def _build_interactive_pie_html(df_values, label_col, value_col, palette, chart_
                 el.addEventListener('mouseleave', clearHighlight);
             }});
 
-            Plotly.newPlot(chart, fig.data, fig.layout, {{responsive:true, displayModeBar:false}}).then(() => {{
+            Plotly.newPlot(chart, fig.data, fig.layout, {{displayModeBar:false}}).then(() => {{
                 chart.on('plotly_hover', ev => {{
                     if (ev && ev.points && ev.points.length) {{
                         setHighlight(ev.points[0].pointNumber);
@@ -681,7 +777,22 @@ def _build_interactive_pie_html(df_values, label_col, value_col, palette, chart_
                 }});
                 chart.on('plotly_unhover', clearHighlight);
                 clearHighlight();
+                resizeChart();
             }});
+
+            if (window.ResizeObserver && wrap) {{
+                new ResizeObserver(scheduleResize).observe(wrap);
+            }}
+
+            if (window.IntersectionObserver) {{
+                new IntersectionObserver(entries => {{
+                    entries.forEach(entry => {{
+                        if (entry.isIntersecting) scheduleResize();
+                    }});
+                }}, {{ threshold: 0.01 }}).observe(wrap || chart);
+            }}
+
+            window.addEventListener('resize', scheduleResize);
         }})();
     </script>
     """
@@ -689,216 +800,387 @@ def _build_interactive_pie_html(df_values, label_col, value_col, palette, chart_
 
 # ─── 6. Interfaz ──────────────────────────────────────────────────────────────
 
+_COMPACT_LAYOUT_CSS = """
+<style>
+    html {
+        scrollbar-gutter: stable;
+    }
+    [data-testid="stMainBlockContainer"] {
+        padding-top: 0.35rem;
+        padding-left: 1.25rem;
+        padding-right: 1.25rem;
+        max-width: 100%;
+    }
+    [data-testid="stHtml"] iframe {
+        display: block !important;
+        width: 100% !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        border: 0 !important;
+        overflow: hidden !important;
+    }
+    [data-testid="stVerticalBlock"] {
+        gap: 0.5rem;
+    }
+    div[data-testid="column"] {
+        padding-left: 0.6rem;
+        padding-right: 0.6rem;
+    }
+    [data-testid="stHorizontalBlock"] {
+        gap: 0.75rem;
+    }
+    [data-testid="stMetric"] {
+        padding: 0.1rem 0;
+    }
+    [data-testid="stMetricLabel"] p {
+        font-size: 0.8rem;
+        margin-bottom: 0.1rem;
+    }
+    [data-testid="stMetricValue"] {
+        font-size: 1.35rem;
+    }
+    [data-testid="stWidgetLabel"] p {
+        font-size: 0.85rem;
+        margin-bottom: 0.15rem;
+    }
+    .inet-filter-label {
+        display: block;
+        font-size: 0.78rem;
+        font-weight: 500;
+        line-height: 1.1;
+        margin: 0 0 0.12rem 0;
+        color: rgba(49, 51, 63, 0.85);
+    }
+    div[data-testid="stSelectbox"] div[data-baseweb="select"] > div {
+        min-height: 1.85rem !important;
+        height: 1.85rem !important;
+    }
+    div[data-testid="stSelectbox"] div[data-baseweb="select"] > div > div {
+        font-size: 0.85rem !important;
+        padding-top: 0 !important;
+        padding-bottom: 0 !important;
+    }
+    div[data-testid="stNumberInput"] input {
+        min-height: 1.85rem !important;
+        height: 1.85rem !important;
+        padding: 0.15rem 0.45rem !important;
+        font-size: 0.85rem !important;
+    }
+    div[data-testid="stNumberInput"] [data-testid="stNumberInputStepDown"],
+    div[data-testid="stNumberInput"] [data-testid="stNumberInputStepUp"] {
+        width: 1.45rem !important;
+        min-width: 1.45rem !important;
+    }
+    div[data-testid="stSelectbox"],
+    div[data-testid="stNumberInput"] {
+        margin-bottom: 0 !important;
+    }
+    .inet-section-title {
+        display: block;
+        margin: 0 0 0.55rem 0;
+        padding: 0.05rem 0 0.15rem 0;
+        font-size: 1rem;
+        font-weight: 600;
+        line-height: 1.35;
+        overflow: visible;
+    }
+    [data-testid="stHtml"],
+    [data-testid="stPlotlyChart"] {
+        margin-top: 0.15rem;
+    }
+    [data-testid="stMarkdown"] h4 {
+        margin: 0.2rem 0 0.45rem 0;
+        line-height: 1.35;
+        overflow: visible;
+    }
+    iframe[title="streamlit_echarts.st_echarts"] {
+        width: 100% !important;
+    }
+</style>
+"""
+st.markdown(_COMPACT_LAYOUT_CSS, unsafe_allow_html=True)
+
 st.markdown(
-    "<h3 style='margin-bottom:0;'>📺 Dashboard de Facturación - CEEL TELEVISION</h3>",
+    "<h3 style='margin:0 0 0.35rem 0;line-height:1.2;'>📺 Dashboard de Facturación - CEEL TELEVISION</h3>",
     unsafe_allow_html=True,
 )
 
-# Filtros laterales
-st.sidebar.header("Filtros")
 periodos_sorted = get_periodos_disponibles()
 if not periodos_sorted:
     periodos_sorted = ["2026-05-01"]
 
-periodo_display = st.sidebar.selectbox("Periodo:", periodos_sorted)
+filt_periodo, filt_top_n, kpi_total, kpi_facturas = st.columns([1.5, 0.85, 1.325, 1.325], gap="small")
+
+with filt_periodo:
+    st.markdown("<span class='inet-filter-label'>Periodo</span>", unsafe_allow_html=True)
+    periodo_display = st.selectbox(
+        "Periodo",
+        periodos_sorted,
+        key="filtro_periodo",
+        label_visibility="collapsed",
+    )
 periodo_sql = to_periodo_sql(periodo_display)
 
-top_n_tarifas = st.sidebar.number_input(
-    "Cantidad de categorías (Top N):",
-    min_value=1,
-    max_value=50,
-    value=TOP_N_TARIFAS_DEFAULT,
-    step=1,
-)
-
-# ── KPIs ──────────────────────────────────────────────────────────────────────
-total_facturado = get_total_facturado(periodo_sql)
-cantidad_facturas = get_cantidad_facturas(periodo_sql)
-
-col1, col2 = st.columns(2)
-col1.metric("Total Facturado",   f"${total_facturado:,.0f}")
-col2.metric("Facturas Emitidas", f"{cantidad_facturas:,}")
-
-st.markdown(
-    "<hr style='margin:0.3rem 0;border:0;border-top:1px solid rgba(127,127,127,0.35);'/>",
-    unsafe_allow_html=True,
-)
-
-# ── Gráficos de distribución ──────────────────────────────────────────────────
-df_tarifas = get_facturacion_por_tarifa(periodo_sql)
-df_servicios = get_ranking_servicios_por_periodo(periodo_sql)
-
-left_col, right_col = st.columns(2)
-
-with left_col:
-    st.markdown("#### Distribución por Tarifa Usuario")
-    if not df_tarifas.empty:
-        df_chart = df_tarifas.copy()
-        if len(df_chart) > top_n_tarifas:
-            top_part  = df_chart.head(top_n_tarifas)
-            otros_val = df_chart.iloc[top_n_tarifas:]["total_facturado"].sum()
-            otros_row = pd.DataFrame({"tarifa_aplicada": ["Otros"], "total_facturado": [otros_val], "cantidad_socios": [0]})
-            df_chart  = pd.concat([top_part, otros_row], ignore_index=True)
-
-        html_pie = _build_interactive_pie_html(
-            df_chart, "tarifa_aplicada", "total_facturado",
-            px.colors.qualitative.Pastel, "pie-tv", hole=0.45,
-        )
-        components.html(html_pie, height=500, scrolling=False)
-    else:
-        st.info("No hay datos de tarifas para el período seleccionado.")
-
-with right_col:
-    st.markdown("#### Total Facturado por Servicios")
-    if not df_servicios.empty:
-        df_bars = df_servicios.copy()
-        if len(df_bars) > top_n_tarifas:
-            top_part = df_bars.head(top_n_tarifas)
-            otros_val = df_bars.iloc[top_n_tarifas:]["total"].sum()
-            otros_cant = df_bars.iloc[top_n_tarifas:]["cantidad"].sum()
-            otros_row = pd.DataFrame({
-                "nombre_concepto": ["Otros"],
-                "total": [otros_val],
-                "cantidad": [otros_cant],
-            })
-            df_bars = pd.concat([top_part, otros_row], ignore_index=True)
-
-        df_bars = df_bars.sort_values("total", ascending=False).copy()
-        x_order = df_bars["nombre_concepto"].tolist()
-        df_bars["nombre_concepto"] = pd.Categorical(
-            df_bars["nombre_concepto"], categories=x_order, ordered=True
-        )
-
-        fig_bars = px.bar(
-            df_bars,
-            x="nombre_concepto",
-            y="total",
-            text="total",
-            color="nombre_concepto",
-            color_discrete_sequence=px.colors.qualitative.Pastel,
-            custom_data=["cantidad"],
-        )
-        fig_bars.update_traces(
-            width=0.85,
-            texttemplate="$%{text:,.0f}",
-            textposition="outside",
-            hovertemplate=(
-                "<b>%{x}</b><br>"
-                "Total Facturado: $%{y:,.0f}<br>"
-                "Cantidad: %{customdata[0]:,.0f}<extra></extra>"
-            ),
-            showlegend=False,
-        )
-        fig_bars.update_layout(
-            margin=dict(t=10, b=80, l=0, r=0),
-            xaxis_title="Servicio",
-            yaxis_title="Total Facturado ($)",
-            xaxis={"categoryorder": "array", "categoryarray": x_order, "tickangle": -35},
-            yaxis=dict(tickprefix="$", tickformat=",.0f"),
-        )
-        st.plotly_chart(fig_bars, width="stretch")
-    else:
-        st.info("No hay datos de servicios para el período seleccionado.")
-
-st.markdown(
-    "<hr style='margin:0.35rem 0;border:0;border-top:1px solid rgba(127,127,127,0.25);'/>",
-    unsafe_allow_html=True,
-)
-
-# ── Área apilada: usuarios por servicio ───────────────────────────────────────
-st.markdown("#### Evolución de Usuarios por Servicio")
-
-periodos_chart = sorted(periodos_sorted)
-df_usuarios_hist = get_ranking_servicios_historico(periodos_chart)
-usuarios_ctx = _prepare_usuarios_pivot(df_usuarios_hist, top_n_tarifas)
-
-if st_echarts is None:
-    st.warning("Instale streamlit-echarts para ver este gráfico: pip install streamlit-echarts")
-elif usuarios_ctx is None:
-    st.info("No hay datos históricos de usuarios por servicio.")
-else:
-    pivot = usuarios_ctx["pivot"]
-    legend_data = usuarios_ctx["legend_data"]
-    legend_key = tuple(legend_data)
-    if st.session_state.get("_usuarios_legend_key") != legend_key:
-        st.session_state.usuarios_kpi_servicios = list(legend_data)
-        st.session_state._usuarios_legend_key = legend_key
-
-    servicios_activos = st.session_state.get("usuarios_kpi_servicios", list(legend_data))
-    legend_selected = {name: (name in servicios_activos) for name in legend_data}
-    area_options = _build_usuarios_area_options(
-        pivot,
-        usuarios_ctx["periodos"],
-        usuarios_ctx["stack_order"],
-        legend_data,
-        legend_selected=legend_selected,
+with filt_top_n:
+    st.markdown("<span class='inet-filter-label'>Top N categorías</span>", unsafe_allow_html=True)
+    top_n_tarifas = st.number_input(
+        "Top N categorías",
+        min_value=1,
+        max_value=50,
+        value=TOP_N_TARIFAS_DEFAULT,
+        step=1,
+        key="filtro_top_n",
+        label_visibility="collapsed",
     )
 
-    chart_col, kpi_col = st.columns([3, 1])
+total_facturado = get_total_facturado(periodo_sql)
+sin_datos = sin_datos_periodo(total_facturado)
+if sin_datos:
+    cantidad_facturas = 0
+else:
+    cantidad_facturas = get_cantidad_facturas(periodo_sql)
 
-    with chart_col:
-        st_echarts(
-            options=area_options,
-            events={
-                "legendselectchanged": "function(params){ return params.selected; }",
-            },
-            on_change=lambda: _sync_usuarios_kpi_servicios(legend_data),
-            key="usuarios_area_chart",
-            height="500px",
+with kpi_total:
+    st.metric("Total Facturado", f"${total_facturado:,.0f}")
+with kpi_facturas:
+    st.metric("Facturas Emitidas", f"{cantidad_facturas:,}")
+
+if sin_datos:
+    left_col, right_col = st.columns(2)
+    with left_col:
+        st.markdown("<p class='inet-section-title'>Distribución por Tarifa Usuario</p>", unsafe_allow_html=True)
+        st.info(NO_RECORDS_MESSAGE)
+    with right_col:
+        st.markdown("<p class='inet-section-title'>Total Facturado por Servicios</p>", unsafe_allow_html=True)
+        st.info(NO_RECORDS_MESSAGE)
+
+    st.markdown(
+        "<hr style='margin:0.35rem 0;border:0;border-top:1px solid rgba(127,127,127,0.25);'/>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("#### Evolución de Usuarios por Servicio")
+    st.info(NO_RECORDS_MESSAGE)
+
+    st.markdown(
+        "<hr style='margin:0.35rem 0;border:0;border-top:1px solid rgba(127,127,127,0.25);'/>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("#### Evolución de Total Facturado")
+    st.info(NO_RECORDS_MESSAGE)
+
+if not sin_datos:
+    # ── Gráficos de distribución ──────────────────────────────────────────────────
+    df_tarifas = get_facturacion_por_tarifa(periodo_sql)
+    df_servicios = get_ranking_servicios_por_periodo(periodo_sql)
+
+    left_col, right_col = st.columns(2)
+
+    with left_col:
+        st.markdown("<p class='inet-section-title'>Distribución por Tarifa Usuario</p>", unsafe_allow_html=True)
+        if not df_tarifas.empty:
+            df_chart = df_tarifas.copy()
+            if len(df_chart) > top_n_tarifas:
+                top_part  = df_chart.head(top_n_tarifas)
+                otros_val = df_chart.iloc[top_n_tarifas:]["total_facturado"].sum()
+                otros_row = pd.DataFrame({"tarifa_aplicada": ["Otros"], "total_facturado": [otros_val], "cantidad_socios": [0]})
+                df_chart  = pd.concat([top_part, otros_row], ignore_index=True)
+
+            html_pie = _build_interactive_pie_html(
+                df_chart, "tarifa_aplicada", "total_facturado",
+                px.colors.qualitative.Pastel, "pie-tv", hole=0.45,
+                height=DIST_CHART_HEIGHT,
+            )
+            components.html(html_pie, height=DIST_CHART_HEIGHT, scrolling=False)
+        else:
+            st.info("No hay datos de tarifas para el período seleccionado.")
+
+    with right_col:
+        st.markdown("<p class='inet-section-title'>Total Facturado por Servicios</p>", unsafe_allow_html=True)
+        if not df_servicios.empty:
+            df_bars = df_servicios.copy()
+            if len(df_bars) > top_n_tarifas:
+                top_part = df_bars.head(top_n_tarifas)
+                otros_val = df_bars.iloc[top_n_tarifas:]["total"].sum()
+                otros_cant = df_bars.iloc[top_n_tarifas:]["cantidad"].sum()
+                otros_row = pd.DataFrame({
+                    "nombre_concepto": ["Otros"],
+                    "total": [otros_val],
+                    "cantidad": [otros_cant],
+                })
+                df_bars = pd.concat([top_part, otros_row], ignore_index=True)
+
+            df_bars = df_bars.sort_values("total", ascending=False).copy()
+            x_order = df_bars["nombre_concepto"].tolist()
+            df_bars["nombre_concepto"] = pd.Categorical(
+                df_bars["nombre_concepto"], categories=x_order, ordered=True
+            )
+
+            fig_bars = px.bar(
+                df_bars,
+                x="nombre_concepto",
+                y="total",
+                text="total",
+                color="nombre_concepto",
+                color_discrete_sequence=px.colors.qualitative.Pastel,
+                custom_data=["cantidad"],
+            )
+            fig_bars.update_traces(
+                width=0.85,
+                texttemplate="$%{text:,.0f}",
+                textposition="outside",
+                hovertemplate=(
+                    "<b>%{x}</b><br>"
+                    "Total Facturado: $%{y:,.0f}<br>"
+                    "Cantidad: %{customdata[0]:,.0f}<extra></extra>"
+                ),
+                showlegend=False,
+            )
+            fig_bars.update_layout(
+                height=DIST_CHART_HEIGHT,
+                margin=dict(t=8, b=72, l=0, r=0, pad=0),
+                xaxis_title="Servicio",
+                yaxis_title="Total Facturado ($)",
+                xaxis={"categoryorder": "array", "categoryarray": x_order, "tickangle": -35},
+                yaxis=dict(tickprefix="$", tickformat=",.0f"),
+            )
+            st.plotly_chart(fig_bars, width="stretch")
+        else:
+            st.info("No hay datos de servicios para el período seleccionado.")
+
+    st.markdown(
+        "<hr style='margin:0.35rem 0;border:0;border-top:1px solid rgba(127,127,127,0.25);'/>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Área apilada: usuarios por servicio ───────────────────────────────────────
+    st.markdown("#### Evolución de Usuarios por Servicio")
+
+    meses_evolucion = st.number_input(
+        "Meses a comparar:",
+        min_value=MESES_EVOLUCION_MIN,
+        max_value=MESES_EVOLUCION_MAX,
+        value=MESES_EVOLUCION_DEFAULT,
+        step=1,
+        key="meses_evolucion_usuarios",
+    )
+
+    periodos_chart = get_periodos_evolucion(periodos_sorted, periodo_sql, meses_evolucion)
+    df_usuarios_hist = get_ranking_servicios_historico(periodos_chart)
+    usuarios_ctx = _prepare_usuarios_pivot(df_usuarios_hist, top_n_tarifas)
+
+    if st_echarts is None:
+        st.warning("Instale streamlit-echarts para ver este gráfico: pip install streamlit-echarts")
+    elif usuarios_ctx is None:
+        st.info("No hay datos históricos de usuarios por servicio.")
+    else:
+        pivot = usuarios_ctx["pivot"]
+        legend_data = usuarios_ctx["legend_data"]
+        legend_selected = _apply_legend_selection(
+            legend_data,
+            st.session_state.get("usuarios_area_chart"),
+        )
+        area_options = _build_usuarios_area_options(
+            pivot,
+            usuarios_ctx["periodos"],
+            usuarios_ctx["stack_order"],
+            legend_data,
+            legend_selected=legend_selected,
         )
 
-    with kpi_col:
-        st.markdown("##### Indicadores")
-        selected_map = {name: (name in servicios_activos) for name in legend_data}
-        kpis = _calc_usuarios_kpis(pivot, selected_map)
+        chart_col, kpi_col = st.columns([3, 1])
 
-        if kpis:
-            st.metric(
-                "Socios (inicio)",
-                f"{kpis['inicio']:,}",
-                help=f"Período {kpis['periodo_inicio']}",
+        with chart_col:
+            chart_state = st_echarts(
+                options=area_options,
+                events={
+                    "legendselectchanged": "function(params){ return params.selected; }",
+                },
+                on_change=lambda: _apply_legend_selection(
+                    legend_data,
+                    st.session_state.get("usuarios_area_chart"),
+                ),
+                key="usuarios_area_chart",
+                height="500px",
             )
-            st.metric(
-                "Socios (fin)",
-                f"{kpis['fin']:,}",
-                delta=f"{kpis['fin'] - kpis['inicio']:,}",
-                help=f"Período {kpis['periodo_fin']}",
-            )
-            if kpis["variacion"] == "baja":
-                label_anual = "Tasa desconexión (período)"
-                label_mensual = "Tasa desconexión mensual"
-                help_anual = "Porcentaje de usuarios perdidos entre el inicio y el fin del rango"
-                help_mensual = "Promedio mensual de la tasa de desconexión en el rango"
-                delta_anual = f"{kpis['delta_usuarios']:,}"
-                delta_mensual = f"{kpis['delta_usuarios_mensual']:,.0f}"
-            elif kpis["variacion"] == "alta":
-                label_anual = "Tasa crecimiento (período)"
-                label_mensual = "Tasa crecimiento mensual"
-                help_anual = "Porcentaje de usuarios ganados entre el inicio y el fin del rango"
-                help_mensual = "Promedio mensual de la tasa de crecimiento en el rango"
-                delta_anual = f"{kpis['delta_usuarios']:,}"
-                delta_mensual = f"{kpis['delta_usuarios_mensual']:,.0f}"
-            else:
-                label_anual = "Variación neta (período)"
-                label_mensual = "Variación mensual promedio"
-                help_anual = "Sin cambio neto de usuarios entre inicio y fin"
-                help_mensual = "Sin cambio neto promedio por mes"
-                delta_anual = None
-                delta_mensual = None
 
-            st.metric(
-                label_anual,
-                f"{kpis['tasa_anual']:.1f}%",
-                delta=delta_anual,
-                help=help_anual,
-            )
-            st.metric(
-                label_mensual,
-                f"{kpis['tasa_mensual']:.1f}%",
-                delta=delta_mensual,
-                help=help_mensual,
-            )
-            st.caption(
-                f"Servicios activos: {kpis['servicios_activos']}. "
-                "Filtrá haciendo clic en la leyenda del gráfico."
-            )
+        kpi_selected = _apply_legend_selection(
+            legend_data,
+            chart_state if chart_state is not None else st.session_state.get("usuarios_area_chart"),
+        )
+
+        with kpi_col:
+            st.markdown("##### Indicadores")
+            kpis = _calc_usuarios_kpis(pivot, kpi_selected)
+
+            if kpis:
+                st.metric(
+                    "Socios (inicio)",
+                    f"{kpis['inicio']:,}",
+                    help=f"Período {kpis['periodo_inicio']}",
+                )
+                st.metric(
+                    "Socios (fin)",
+                    f"{kpis['fin']:,}",
+                    delta=f"{kpis['fin'] - kpis['inicio']:,}",
+                    help=f"Período {kpis['periodo_fin']}",
+                )
+                if kpis["variacion"] == "baja":
+                    label_anual = "Tasa desconexión (período)"
+                    label_mensual = "Tasa desconexión mensual"
+                    help_anual = "Porcentaje de usuarios perdidos entre el inicio y el fin del rango"
+                    help_mensual = "Promedio mensual de la tasa de desconexión en el rango"
+                    delta_anual = f"{kpis['delta_usuarios']:,}"
+                    delta_mensual = f"{kpis['delta_usuarios_mensual']:,.0f}"
+                elif kpis["variacion"] == "alta":
+                    label_anual = "Tasa crecimiento (período)"
+                    label_mensual = "Tasa crecimiento mensual"
+                    help_anual = "Porcentaje de usuarios ganados entre el inicio y el fin del rango"
+                    help_mensual = "Promedio mensual de la tasa de crecimiento en el rango"
+                    delta_anual = f"{kpis['delta_usuarios']:,}"
+                    delta_mensual = f"{kpis['delta_usuarios_mensual']:,.0f}"
+                else:
+                    label_anual = "Variación neta (período)"
+                    label_mensual = "Variación mensual promedio"
+                    help_anual = "Sin cambio neto de usuarios entre inicio y fin"
+                    help_mensual = "Sin cambio neto promedio por mes"
+                    delta_anual = None
+                    delta_mensual = None
+
+                st.metric(
+                    label_anual,
+                    f"{kpis['tasa_anual']:.1f}%",
+                    delta=delta_anual,
+                    help=help_anual,
+                )
+                st.metric(
+                    label_mensual,
+                    f"{kpis['tasa_mensual']:.1f}%",
+                    delta=delta_mensual,
+                    help=help_mensual,
+                )
+                st.caption(
+                    f"Servicios activos: {kpis['servicios_activos']} de {len(legend_data)}. "
+                    "Los indicadores reflejan solo los grupos visibles en la leyenda."
+                )
+
+    st.markdown(
+        "<hr style='margin:0.35rem 0;border:0;border-top:1px solid rgba(127,127,127,0.25);'/>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("#### Evolución de Total Facturado")
+    meses_total = st.number_input(
+        "Meses a comparar (total):",
+        min_value=MESES_EVOLUCION_MIN,
+        max_value=MESES_EVOLUCION_MAX,
+        value=MESES_EVOLUCION_DEFAULT,
+        step=1,
+        key="meses_evolucion_total",
+    )
+    periodos_total = get_periodos_evolucion(periodos_sorted, periodo_sql, meses_total)
+    df_total_hist = fetch_totales_por_periodos(engine, periodos_total, SERVICIO_TIPO)
+    if df_total_hist.empty or float(df_total_hist["total_facturado"].sum()) <= 0:
+        st.info("No hay datos históricos de total facturado.")
+    else:
+        fig_total = build_evolucion_total_fig(df_total_hist, height=DIST_CHART_HEIGHT)
+        st.plotly_chart(fig_total, width="stretch")
+

@@ -10,6 +10,8 @@ import json
 import os
 
 from common.periods import fetch_periodos_disponibles
+from common.empty_state import NO_RECORDS_MESSAGE, sin_datos_periodo
+from common.evolucion_facturado import build_evolucion_total_fig, historico_desde_getter
 
 try:
     from dotenv import load_dotenv
@@ -21,6 +23,13 @@ st.set_page_config(page_title="Dashboard CEEL", layout="wide")
 
 # 2. Configuración de variables
 TOP_N_TARIFAS_DEFAULT = 6
+MESES_EVOLUCION_DEFAULT = 6
+MESES_EVOLUCION_MIN = 2
+MESES_EVOLUCION_MAX = 12
+DIST_CHART_HEIGHT = 360
+PIE_DOMAIN_X = (0.0, 0.58)
+PIE_DOMAIN_Y = (0.02, 0.98)
+PIE_CENTER_X = (PIE_DOMAIN_X[0] + PIE_DOMAIN_X[1]) / 2
 SERVICIO_TIPO = 'energia'
 
 # 3. Motor de conexión
@@ -81,6 +90,26 @@ def to_periodo_sql(value):
     if len(text_value) == 10 and text_value[4] == '-' and text_value[7] == '-':
         return text_value
     return pd.to_datetime(text_value, dayfirst=True).strftime('%Y-%m-%d')
+
+
+def get_periodos_evolucion(periodos, periodo_fin, cantidad_meses):
+    """Devuelve los últimos N períodos disponibles hasta el período seleccionado."""
+    if not periodos:
+        return []
+
+    periodo_fin_ts = pd.to_datetime(periodo_fin, errors="coerce")
+    periodos_dt = (
+        pd.Series(periodos)
+        .map(lambda p: pd.to_datetime(to_periodo_sql(p), errors="coerce"))
+        .dropna()
+        .drop_duplicates()
+        .sort_values()
+    )
+
+    if pd.notna(periodo_fin_ts):
+        periodos_dt = periodos_dt[periodos_dt <= periodo_fin_ts]
+
+    return [p.strftime("%Y-%m-%d") for p in periodos_dt.tail(int(cantidad_meses))]
 
 
 @st.cache_data
@@ -296,617 +325,673 @@ def get_kpis_por_periodo(periodo):
     except Exception:
         return _zero
 
-# 5. Interfaz
-st.markdown(
-    "<h3 style='margin-bottom: 0;'>📊 Dashboard de Facturación - CEEL ENERGIA ( ABR - 2026)</h3>",
-    unsafe_allow_html=True,
-)
 
-# Filtros laterales
-st.sidebar.header("Filtros")
-periodos_sorted = get_periodos_disponibles()
-if not periodos_sorted:
-    periodos_sorted = ['01-05-2026', '01-04-2026']
+def _build_interactive_pie_html(df_values, label_col, value_col, palette, chart_id, hole=0.45, height=DIST_CHART_HEIGHT):
+    """Genera el HTML de un pie/donut Plotly interactivo con leyenda sincronizada."""
+    df_plot = df_values.copy()
+    df_plot["label"] = df_plot[label_col].astype(str)
+    colors = [palette[i % len(palette)] for i in range(len(df_plot))]
+    values = pd.to_numeric(df_plot[value_col], errors="coerce").fillna(0.0)
+    total = float(values.sum())
+    percents = [(float(v) / total * 100) if total else 0.0 for v in values]
 
-# Mostrar el periodo más reciente por defecto (primer elemento de la lista ordenada)
-periodo_display = st.sidebar.selectbox("Periodo:", periodos_sorted)
-
-periodo_sql = to_periodo_sql(periodo_display)
-top_n_tarifas = st.sidebar.number_input(
-    "Cantidad de categorías (Top N):",
-    min_value=1,
-    max_value=50,
-    value=TOP_N_TARIFAS_DEFAULT,
-    step=1,
-)
-
-# KPIs
-# Obtener KPIs desde la base de datos para el periodo seleccionado
-kpis = get_kpis_por_periodo(periodo_sql)
-total_facturado = kpis['total_facturado']
-importe_neto_energia = kpis['importe_neto_energia']
-importe_otros_conceptos = kpis['importe_otros_conceptos']
-consumo_kwh_real = kpis['consumo_kwh_real']
-
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Total Facturado", f"${total_facturado:,.0f}")
-col2.metric("Importe Neto Energía", f"${importe_neto_energia:,.0f}")
-col3.metric("Importe Otros Conceptos", f"${importe_otros_conceptos:,.0f}")
-col4.metric("kW Total Distribuidos", f"{consumo_kwh_real:,.0f}")
-
-st.markdown(
-    "<hr style='margin:0.3rem 0;border:0;border-top:1px solid rgba(127,127,127,0.35);' />",
-    unsafe_allow_html=True,
-)
-
-# 6. Gráfico de Anillo
-
-df_totalizado_tarifa = get_facturacion_por_tarifa_base(periodo_sql)
-
-# Preparar datos para el gráfico de anillo (segmentación por grupos de servicio).
-df_kpi_serv = kpis.get('detalle_servicios', pd.DataFrame())
-if not df_kpi_serv.empty:
-    df_kpi_serv = df_kpi_serv[df_kpi_serv['total_facturado'] > 0].sort_values(
-        by='total_facturado', ascending=False
+    fig = px.pie(
+        df_plot,
+        values=value_col,
+        names="label",
+        hole=hole,
+        color_discrete_sequence=colors,
     )
-    if len(df_kpi_serv) > top_n_tarifas:
-        top_serv = df_kpi_serv.head(top_n_tarifas)
-        otros_serv = pd.DataFrame({
-            'nombre_servicio': ['Otros'],
-            'total_facturado': [df_kpi_serv.iloc[top_n_tarifas:]['total_facturado'].sum()],
-        })
-        df_serv_donut = pd.concat([top_serv, otros_serv], ignore_index=True)
-    else:
-        df_serv_donut = df_kpi_serv.copy()
-    df_tarifa_procesado = df_serv_donut[['nombre_servicio', 'total_facturado']].rename(
-        columns={'nombre_servicio': 'tarifa_base'}
+    fig.update_traces(
+        textposition="inside",
+        textinfo="text",
+        texttemplate="%{label}<br>%{percent}",
+        insidetextorientation="horizontal",
+        textfont=dict(size=12),
+        hoverinfo="none",
+        hovertemplate="<extra></extra>",
+        domain=dict(x=list(PIE_DOMAIN_X), y=list(PIE_DOMAIN_Y)),
     )
-else:
-    df_tarifa_procesado = pd.DataFrame(columns=['tarifa_base', 'total_facturado'])
-
-if not df_tarifa_procesado.empty:
-    df_tarifa_procesado = df_tarifa_procesado.copy()
-    df_tarifa_procesado['label'] = df_tarifa_procesado['tarifa_base'].apply(normalize_label)
-    palette = px.colors.qualitative.Pastel
-    slice_colors = [palette[index % len(palette)] for index in range(len(df_tarifa_procesado))]
-
-    fig_donut = px.pie(
-        df_tarifa_procesado,
-        values='total_facturado',
-        names='label',
-        hole=0.4,
-        color_discrete_sequence=slice_colors,
-    )
-    
-    # Personalización: Mostrar nombre de categoría + porcentaje dentro de cada porción
-    fig_donut.update_traces(
-        textposition='inside',
-        textinfo='label+percent',
-        insidetextorientation='auto',
-        textfont=dict(size=16),
-        hovertemplate='%{label}<br>Total facturado: $%{value:,.0f}<extra></extra>'
-    )
-    fig_donut.update_layout(
+    fig.update_layout(
         showlegend=False,
+        hovermode="closest",
+        width=800,
+        height=height,
+        autosize=False,
         margin=dict(t=0, b=0, l=0, r=0),
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)'
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
     )
-    
-    donut_json = pio.to_json(fig_donut, validate=False)
-    legend_items = []
-    for index, row in df_tarifa_procesado.reset_index(drop=True).iterrows():
-        color = slice_colors[index % len(slice_colors)]
-        legend_items.append(
-            f'<div class="legend-item" data-index="{index}" style="display:flex;align-items:center;gap:8px;padding:3px 0;cursor:default;opacity:1;transition:opacity 120ms ease;">'
-            f'<span style="width:12px;height:12px;flex:0 0 12px;border-radius:2px;border:1px solid rgba(0,0,0,0.18);background:{color};"></span>'
-            f'<span class="legend-label" style="font-size:0.92rem;line-height:1.2;">{escape(str(row["label"]))}</span>'
-            f'</div>'
-        )
 
-    # Render en columnas: ocupar 50% del ancho para este gráfico (columna izquierda)
-    left_col, right_col = st.columns(2)
+    fig_json = pio.to_json(fig, validate=False)
+    legend_items = "".join(
+        f'<div class="legend-item" data-index="{i}" style="display:flex;align-items:center;gap:5px;padding:1px 0;cursor:default;opacity:1;transition:opacity 120ms ease;">'
+        f'<span style="width:8px;height:8px;flex:0 0 8px;border-radius:2px;border:1px solid rgba(0,0,0,0.18);background:{colors[i]};"></span>'
+        f'<span class="legend-label" style="font-size:0.72rem;line-height:1.15;">{escape(str(row["label"]))}</span>'
+        f"</div>"
+        for i, (_, row) in enumerate(df_plot.reset_index(drop=True).iterrows())
+    )
+    colors_json = json.dumps(colors)
+    percents_json = json.dumps([round(p, 1) for p in percents])
 
-    donut_html = fr"""
+    wrap_cls = f"wrap-{chart_id}"
+    chart_div = f"chart-{chart_id}"
+    leg_div = f"legend-{chart_id}"
+    center_div = f"center-{chart_id}"
+    chart_area = f"chart-area-{chart_id}"
+
+    return fr"""
     <style>
-        html, body {{
-            margin: 0;
-            padding: 0;
-            background: transparent;
-            overflow: hidden;
+        html,body{{
+            margin:0;
+            padding:0;
+            background:transparent;
+            overflow:hidden;
+            box-sizing:border-box;
         }}
-        * {{
+        *,*::before,*::after{{box-sizing:border-box;}}
+        .{wrap_cls}{{
+            position:relative;
+            width:100%;
+            height:{height}px;
+            overflow:hidden;
         }}
-        .donut-wrap {{
-            display: flex;
-            align-items: flex-start;
-            gap: 12px;
-            width: 100%;
+        #{chart_div}{{
+            width:100%;
+            height:{height}px;
+            max-width:100%;
+            background:transparent;
+            overflow:hidden;
         }}
-        #donut-chart {{
-            flex: 1 1 0;
-            min-width: 0;
-            background: transparent;
+        #{chart_div} .main-svg{{display:block;}}
+        #{chart_div} .hoverlayer,#{chart_div} .hovertext{{display:none !important;pointer-events:none !important;}}
+        #{leg_div}{{
+            position:absolute;top:8px;right:8px;left:auto;z-index:10;display:flex;flex-direction:column;
+            gap:3px;max-width:42%;padding:6px 8px;border-radius:6px;background:rgba(255,255,255,0.82);
+            box-shadow:0 1px 4px rgba(0,0,0,0.05);
         }}
-        .donut-legend {{
-            flex: 0 0 auto;
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-            gap: 6px;
-            padding-top: 140px;
+        .legend-item:hover{{opacity:0.7;}}
+        .legend-label{{font-size:0.72rem;line-height:1.15;color:#7d7d7d;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
+        .{chart_area}{{position:relative;width:100%;height:{height}px;overflow:hidden;}}
+        #{center_div}{{
+            position:absolute;top:50%;left:{PIE_CENTER_X * 100:.2f}%;transform:translate(-50%, -50%);
+            z-index:20;pointer-events:none;text-align:center;min-width:72px;visibility:hidden;
         }}
-        .legend-item:hover {{
-            opacity: 0.7;
-        }}
-        .legend-label {{
-            font-size: 0.92rem;
-            line-height: 1.2;
-            /* Color gris estático que funciona bien en ambos temas */
-            color: #7d7d7d;
-            font-weight: 500;
-        }}
+        #{center_div}.visible{{visibility:visible;}}
+        .center-pct-{chart_id}{{font-size:2.75rem;font-weight:900;line-height:1;letter-spacing:-0.02em;color:#ffffff;text-shadow:-1px -1px 0 rgba(30,30,30,0.85),1px -1px 0 rgba(30,30,30,0.85),-1px  1px 0 rgba(30,30,30,0.85),1px  1px 0 rgba(30,30,30,0.85),0 0 6px rgba(0,0,0,0.35);}}
     </style>
-    <div class="donut-wrap">
-        <div id="donut-chart" style="min-height:420px;"></div>
-        <div class="donut-legend">
-            {''.join(legend_items)}
+    <div class="{wrap_cls}">
+        <div id="{leg_div}">{legend_items}</div>
+        <div class="{chart_area}">
+            <div id="{center_div}"></div>
+            <div id="{chart_div}"></div>
         </div>
     </div>
     <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
     <script>
-        const fig = {donut_json};
-        const baseColors = {json.dumps(slice_colors)};
-        const chart = document.getElementById('donut-chart');
-        const legendItems = Array.from(document.querySelectorAll('.legend-item'));
-        const baseTextSize = (fig.data[0].textfont && fig.data[0].textfont.size) ? fig.data[0].textfont.size : 16;
-        const hoverTextSize = baseTextSize + 3;
-        const basePull = (fig.data[0].labels || []).map(() => 0);
-        let skipNextPlotlyHover = false;
+        (function(){{
+            const fig = {fig_json};
+            const baseColors = {colors_json};
+            const percents = {percents_json};
+            const chart = document.getElementById('{chart_div}');
+            const wrap = document.querySelector('.{wrap_cls}');
+            const centerEl = document.getElementById('{center_div}');
+            const legendItems = Array.from(document.querySelectorAll('#{leg_div} .legend-item'));
+            const baseTextSize = (fig.data[0].textfont && fig.data[0].textfont.size) ? fig.data[0].textfont.size : 13;
+            const hoverTextSize = baseTextSize + 3;
+            const basePull = (fig.data[0].labels || []).map(() => 0);
+            let resizeTimer = null;
 
-        function normalizeColor(color, alpha) {{
-            if (!color) return color;
-            if (color.startsWith('#')) {{
-                const hex = color.slice(1);
-                const fullHex = hex.length === 3 ? hex.split('').map((char) => char + char).join('') : hex;
-                const number = parseInt(fullHex, 16);
-                return `rgba(${{(number >> 16) & 255}}, ${{(number >> 8) & 255}}, ${{number & 255}}, ${{alpha}})`;
+            function resizeChart() {{
+                if (!chart || !wrap || !chart.isConnected) return;
+                const width = Math.floor(wrap.clientWidth);
+                const height = Math.floor(wrap.clientHeight);
+                if (width <= 0 || height <= 0) return;
+                Plotly.relayout(chart, {{ width: width, height: height }});
             }}
-            return color;
-        }}
 
-        function colorsForIndex(activeIndex) {{
-            return baseColors.map((color, index) => normalizeColor(color, index === activeIndex ? 1 : 0.2));
-        }}
-
-        function pullForIndex(activeIndex) {{
-            return basePull.map((value, index) => index === activeIndex ? 0.08 : value);
-        }}
-
-        function clearHighlight() {{
-            Plotly.restyle(chart, {{
-                'marker.colors': [baseColors],
-                'pull': [basePull],
-                'textfont.size': baseTextSize
-            }}, [0]);
-            Plotly.Fx.unhover(chart);
-            legendItems.forEach((item) => {{
-                item.style.opacity = '1';
-                item.style.fontWeight = '400';
-            }});
-        }}
-
-        function setHighlight(index, showNativeHover) {{
-            Plotly.restyle(chart, {{
-                'marker.colors': [colorsForIndex(index)],
-                'pull': [pullForIndex(index)],
-                'textfont.size': hoverTextSize
-            }}, [0]);
-            if (showNativeHover) {{
-                skipNextPlotlyHover = true;
-                Plotly.Fx.hover(chart, [{{curveNumber: 0, pointNumber: index}}]);
+            function scheduleResize() {{
+                if (resizeTimer) clearTimeout(resizeTimer);
+                resizeTimer = setTimeout(() => {{
+                    resizeChart();
+                    requestAnimationFrame(resizeChart);
+                }}, 16);
             }}
-            legendItems.forEach((item) => {{
-                const isActive = Number(item.dataset.index) === index;
-                item.style.opacity = isActive ? '1' : '0.35';
-                item.style.fontWeight = isActive ? '600' : '400';
-            }});
-        }}
 
-        legendItems.forEach((item) => {{
-            const index = Number(item.dataset.index);
-            item.addEventListener('mouseenter', () => setHighlight(index, true));
-            item.addEventListener('mouseleave', clearHighlight);
-        }});
-
-        Plotly.newPlot(chart, fig.data, fig.layout, {{responsive: true, displayModeBar: false}}).then(() => {{
-            chart.on('plotly_hover', (eventData) => {{
-                if (eventData && eventData.points && eventData.points.length > 0) {{
-                    if (skipNextPlotlyHover) {{
-                        skipNextPlotlyHover = false;
-                        return;
-                    }}
-                    setHighlight(eventData.points[0].pointNumber, false);
+            function updateCenter(idx) {{
+                if (idx === null || idx === undefined) {{
+                    centerEl.classList.remove('visible');
+                    centerEl.innerHTML = '';
+                    return;
                 }}
+                const pct = percents[idx];
+                centerEl.innerHTML = '<div class="center-pct-{chart_id}">' + pct.toFixed(1) + '%</div>';
+                centerEl.classList.add('visible');
+            }}
+
+            function hexToRgba(color, alpha) {{
+                if (!color) return color;
+                if (color.startsWith('#')) {{
+                    const h = color.slice(1);
+                    const f = h.length === 3 ? h.split('').map(c => c+c).join('') : h;
+                    const n = parseInt(f, 16);
+                    return `rgba(${{(n>>16)&255}},${{(n>>8)&255}},${{n&255}},${{alpha}})`;
+                }}
+                return color;
+            }}
+
+            function clearHighlight() {{
+                Plotly.restyle(chart, {{'marker.colors':[baseColors],'pull':[basePull],'textfont.size':baseTextSize}},[0]);
+                Plotly.Fx.unhover(chart);
+                legendItems.forEach(el => {{ el.style.opacity='1'; el.style.fontWeight='400'; }});
+                updateCenter(null);
+            }}
+
+            function setHighlight(idx) {{
+                const cols = baseColors.map((c,i) => hexToRgba(c, i===idx?1:0.2));
+                const pull = basePull.map((_,i) => i===idx?0.08:0);
+                Plotly.restyle(chart, {{'marker.colors':[cols],'pull':[pull],'textfont.size':hoverTextSize}},[0]);
+                legendItems.forEach(el => {{
+                    const a = Number(el.dataset.index)===idx;
+                    el.style.opacity = a?'1':'0.35';
+                    el.style.fontWeight = a?'600':'400';
+                }});
+                updateCenter(idx);
+            }}
+
+            legendItems.forEach(el => {{
+                const i = Number(el.dataset.index);
+                el.addEventListener('mouseenter', () => setHighlight(i));
+                el.addEventListener('mouseleave', clearHighlight);
             }});
-            chart.on('plotly_unhover', clearHighlight);
-            clearHighlight();
-        }});
+
+            Plotly.newPlot(chart, fig.data, fig.layout, {{displayModeBar:false}}).then(() => {{
+                chart.on('plotly_hover', ev => {{
+                    if (ev && ev.points && ev.points.length) {{
+                        setHighlight(ev.points[0].pointNumber);
+                    }}
+                }});
+                chart.on('plotly_unhover', clearHighlight);
+                clearHighlight();
+                resizeChart();
+            }});
+
+            if (window.ResizeObserver && wrap) {{
+                new ResizeObserver(scheduleResize).observe(wrap);
+            }}
+
+            if (window.IntersectionObserver) {{
+                new IntersectionObserver(entries => {{
+                    entries.forEach(entry => {{
+                        if (entry.isIntersecting) scheduleResize();
+                    }});
+                }}, {{ threshold: 0.01 }}).observe(wrap || chart);
+            }}
+
+            window.addEventListener('resize', scheduleResize);
+        }})();
     </script>
     """
-    
-    with left_col:
-        st.markdown("#### Distr. de Fact. por Servicios")
-        components.html(donut_html, height=500, scrolling=False)
-    with right_col:
-        st.markdown("#### Distr. de Fact. por Tarifa Base")
-        df_tarifa_torta = df_totalizado_tarifa.copy() if not df_totalizado_tarifa.empty else pd.DataFrame(columns=['tarifa_base', 'total_facturado'])
 
-        if not df_tarifa_torta.empty:
-            df_tarifa_torta = df_tarifa_torta[df_tarifa_torta['total_facturado'] > 0].sort_values(
-                by='total_facturado', ascending=False
-            )
-            df_tarifa_torta['label'] = df_tarifa_torta['tarifa_base'].apply(normalize_label)
 
-            if len(df_tarifa_torta) > top_n_tarifas:
-                top_tb = df_tarifa_torta.head(top_n_tarifas)
-                otros_tb = pd.DataFrame({
-                    'tarifa_base': ['Otros'],
-                    'total_facturado': [df_tarifa_torta.iloc[top_n_tarifas:]['total_facturado'].sum()],
-                    'label': ['Otros'],
-                })
-                df_torta_tarifa = pd.concat([top_tb, otros_tb], ignore_index=True)
-            else:
-                df_torta_tarifa = df_tarifa_torta
-
-            pie_palette = px.colors.qualitative.Set3
-            pie_slice_colors = [pie_palette[index % len(pie_palette)] for index in range(len(df_torta_tarifa))]
-
-            fig_torta_tarifa = px.pie(
-                df_torta_tarifa,
-                values='total_facturado',
-                names='label',
-                hole=0,
-                color_discrete_sequence=pie_slice_colors,
-            )
-            fig_torta_tarifa.update_traces(
-                textposition='inside',
-                textinfo='label+percent',
-                insidetextorientation='auto',
-                textfont=dict(size=16),
-                hovertemplate='%{label}<br>Total facturado: $%{value:,.0f}<extra></extra>',
-            )
-            fig_torta_tarifa.update_layout(
-                showlegend=False,
-                margin=dict(t=0, b=0, l=0, r=0),
-                paper_bgcolor='rgba(0,0,0,0)',
-                plot_bgcolor='rgba(0,0,0,0)',
-            )
-
-            pie_json = pio.to_json(fig_torta_tarifa, validate=False)
-            pie_legend_items = []
-            for index, row in df_torta_tarifa.reset_index(drop=True).iterrows():
-                color = pie_slice_colors[index % len(pie_slice_colors)]
-                pie_legend_items.append(
-                    f'<div class="legend-item" data-index="{index}" style="display:flex;align-items:center;gap:8px;padding:3px 0;cursor:default;opacity:1;transition:opacity 120ms ease;">'
-                    f'<span style="width:12px;height:12px;flex:0 0 12px;border-radius:2px;border:1px solid rgba(0,0,0,0.18);background:{color};"></span>'
-                    f'<span class="legend-label" style="font-size:0.92rem;line-height:1.2;">{escape(str(row["label"]))}</span>'
-                    f'</div>'
-                )
-
-            pie_html = fr"""
-            <style>
-                html, body {{
-                    margin: 0;
-                    padding: 0;
-                    background: transparent;
-                    overflow: hidden;
-                }}
-                * {{
-                    box-sizing: border-box;
-                }}
-                .pie-wrap {{
-                    display: flex;
-                    align-items: flex-start;
-                    gap: 12px;
-                    width: 100%;
-                }}
-                #pie-chart {{
-                    flex: 1 1 0;
-                    min-width: 0;
-                    background: transparent;
-                }}
-                .pie-legend {{
-                    flex: 0 0 auto;
-                    display: flex;
-                    flex-direction: column;
-                    justify-content: center;
-                    gap: 6px;
-                    padding-top: 140px;
-                }}
-                .legend-item:hover {{
-                    opacity: 0.7;
-                }}
-                .legend-label {{
-                    font-size: 0.92rem;
-                    line-height: 1.2;
-                    color: #7d7d7d;
-                    font-weight: 500;
-                }}
-            </style>
-            <div class="pie-wrap">
-                <div id="pie-chart" style="min-height:420px;"></div>
-                <div class="pie-legend">
-                    {''.join(pie_legend_items)}
-                </div>
-            </div>
-            <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
-            <script>
-                const fig = {pie_json};
-                const baseColors = {json.dumps(pie_slice_colors)};
-                const chart = document.getElementById('pie-chart');
-                const legendItems = Array.from(document.querySelectorAll('.legend-item'));
-                const baseTextSize = (fig.data[0].textfont && fig.data[0].textfont.size) ? fig.data[0].textfont.size : 16;
-                const hoverTextSize = baseTextSize + 3;
-                const basePull = (fig.data[0].labels || []).map(() => 0);
-                let skipNextPlotlyHover = false;
-
-                function normalizeColor(color, alpha) {{
-                    if (!color) return color;
-                    if (color.startsWith('#')) {{
-                        const hex = color.slice(1);
-                        const fullHex = hex.length === 3 ? hex.split('').map((char) => char + char).join('') : hex;
-                        const number = parseInt(fullHex, 16);
-                        return `rgba(${{(number >> 16) & 255}}, ${{(number >> 8) & 255}}, ${{number & 255}}, ${{alpha}})`;
-                    }}
-                    return color;
-                }}
-
-                function colorsForIndex(activeIndex) {{
-                    return baseColors.map((color, index) => normalizeColor(color, index === activeIndex ? 1 : 0.2));
-                }}
-
-                function pullForIndex(activeIndex) {{
-                    return basePull.map((value, index) => index === activeIndex ? 0.08 : value);
-                }}
-
-                function clearHighlight() {{
-                    Plotly.restyle(chart, {{
-                        'marker.colors': [baseColors],
-                        'pull': [basePull],
-                        'textfont.size': baseTextSize
-                    }}, [0]);
-                    Plotly.Fx.unhover(chart);
-                    legendItems.forEach((item) => {{
-                        item.style.opacity = '1';
-                        item.style.fontWeight = '400';
-                    }});
-                }}
-
-                function setHighlight(index, showNativeHover) {{
-                    Plotly.restyle(chart, {{
-                        'marker.colors': [colorsForIndex(index)],
-                        'pull': [pullForIndex(index)],
-                        'textfont.size': hoverTextSize
-                    }}, [0]);
-                    if (showNativeHover) {{
-                        skipNextPlotlyHover = true;
-                        Plotly.Fx.hover(chart, [{{curveNumber: 0, pointNumber: index}}]);
-                    }}
-                    legendItems.forEach((item) => {{
-                        const isActive = Number(item.dataset.index) === index;
-                        item.style.opacity = isActive ? '1' : '0.35';
-                        item.style.fontWeight = isActive ? '600' : '400';
-                    }});
-                }}
-
-                legendItems.forEach((item) => {{
-                    const index = Number(item.dataset.index);
-                    item.addEventListener('mouseenter', () => setHighlight(index, true));
-                    item.addEventListener('mouseleave', clearHighlight);
-                }});
-
-                Plotly.newPlot(chart, fig.data, fig.layout, {{responsive: true, displayModeBar: false}}).then(() => {{
-                    chart.on('plotly_hover', (eventData) => {{
-                        if (eventData && eventData.points && eventData.points.length > 0) {{
-                            if (skipNextPlotlyHover) {{
-                                skipNextPlotlyHover = false;
-                                return;
-                            }}
-                            setHighlight(eventData.points[0].pointNumber, false);
-                        }}
-                    }});
-                    chart.on('plotly_unhover', clearHighlight);
-                    clearHighlight();
-                }});
-            </script>
-            """
-
-            components.html(pie_html, height=500, scrolling=False)
-        else:
-            st.info("No hay datos de tarifa base para el período seleccionado.")
-else:
-    st.warning("No hay datos disponibles para mostrar el gráfico.")
+# ─── 5. Interfaz ──────────────────────────────────────────────────────────────
+_COMPACT_LAYOUT_CSS = """
+<style>
+    html {
+        scrollbar-gutter: stable;
+    }
+    [data-testid="stMainBlockContainer"] {
+        padding-top: 0.35rem;
+        padding-left: 1.25rem;
+        padding-right: 1.25rem;
+        max-width: 100%;
+    }
+    [data-testid="stHtml"] iframe {
+        display: block !important;
+        width: 100% !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        border: 0 !important;
+        overflow: hidden !important;
+    }
+    [data-testid="stVerticalBlock"] {
+        gap: 0.5rem;
+    }
+    div[data-testid="column"] {
+        padding-left: 0.6rem;
+        padding-right: 0.6rem;
+    }
+    [data-testid="stHorizontalBlock"] {
+        gap: 0.75rem;
+    }
+    [data-testid="stMetric"] {
+        padding: 0.1rem 0;
+    }
+    [data-testid="stMetricLabel"] p {
+        font-size: 0.8rem;
+        margin-bottom: 0.1rem;
+    }
+    [data-testid="stMetricValue"] {
+        font-size: 1.35rem;
+    }
+    [data-testid="stWidgetLabel"] p {
+        font-size: 0.85rem;
+        margin-bottom: 0.15rem;
+    }
+    .inet-filter-label {
+        display: block;
+        font-size: 0.78rem;
+        font-weight: 500;
+        line-height: 1.1;
+        margin: 0 0 0.12rem 0;
+        color: rgba(49, 51, 63, 0.85);
+    }
+    div[data-testid="stSelectbox"] div[data-baseweb="select"] > div {
+        min-height: 1.85rem !important;
+        height: 1.85rem !important;
+    }
+    div[data-testid="stSelectbox"] div[data-baseweb="select"] > div > div {
+        font-size: 0.85rem !important;
+        padding-top: 0 !important;
+        padding-bottom: 0 !important;
+    }
+    div[data-testid="stNumberInput"] input {
+        min-height: 1.85rem !important;
+        height: 1.85rem !important;
+        padding: 0.15rem 0.45rem !important;
+        font-size: 0.85rem !important;
+    }
+    div[data-testid="stNumberInput"] [data-testid="stNumberInputStepDown"],
+    div[data-testid="stNumberInput"] [data-testid="stNumberInputStepUp"] {
+        width: 1.45rem !important;
+        min-width: 1.45rem !important;
+    }
+    div[data-testid="stSelectbox"],
+    div[data-testid="stNumberInput"] {
+        margin-bottom: 0 !important;
+    }
+    .inet-section-title {
+        display: block;
+        margin: 0 0 0.55rem 0;
+        padding: 0.05rem 0 0.15rem 0;
+        font-size: 1rem;
+        font-weight: 600;
+        line-height: 1.35;
+        overflow: visible;
+    }
+    [data-testid="stHtml"],
+    [data-testid="stPlotlyChart"] {
+        margin-top: 0.15rem;
+    }
+    [data-testid="stMarkdown"] h4 {
+        margin: 0.2rem 0 0.45rem 0;
+        line-height: 1.35;
+        overflow: visible;
+    }
+    iframe[title="streamlit_echarts.st_echarts"] {
+        width: 100% !important;
+    }
+</style>
+"""
+st.markdown(_COMPACT_LAYOUT_CSS, unsafe_allow_html=True)
 
 st.markdown(
-    "<hr style='margin:0.35rem 0;border:0;border-top:1px solid rgba(127,127,127,0.25);' />",
+    "<h3 style='margin:0 0 0.35rem 0;line-height:1.2;'>⚡ Dashboard de Facturación - CEEL ENERGÍA</h3>",
     unsafe_allow_html=True,
 )
 
-st.subheader("Top 10 Consumidores por Tarifa Base")
+periodos_sorted = get_periodos_disponibles()
+if not periodos_sorted:
+    periodos_sorted = ['01-05-2026', '01-04-2026']
 
-df_consumidores = get_consumidores_por_periodo(periodo_sql)
+filt_periodo, filt_top_n, kpi_total, kpi_neto, kpi_otros, kpi_kwh = st.columns(
+    [1.2, 0.75, 1.05, 1.05, 1.05, 1.05], gap="small"
+)
 
-if not df_totalizado_tarifa.empty:
-    categorias_top10 = df_totalizado_tarifa['tarifa_base'].tolist()
-    categoria_sel = st.selectbox(
-        "Tarifa Base:",
-        options=categorias_top10,
-        key="top10_categoria",
+with filt_periodo:
+    st.markdown("<span class='inet-filter-label'>Periodo</span>", unsafe_allow_html=True)
+    periodo_display = st.selectbox(
+        "Periodo",
+        periodos_sorted,
+        key="filtro_periodo",
+        label_visibility="collapsed",
+    )
+periodo_sql = to_periodo_sql(periodo_display)
+
+with filt_top_n:
+    st.markdown("<span class='inet-filter-label'>Top N categorías</span>", unsafe_allow_html=True)
+    top_n_tarifas = st.number_input(
+        "Top N categorías",
+        min_value=1,
+        max_value=50,
+        value=TOP_N_TARIFAS_DEFAULT,
+        step=1,
+        key="filtro_top_n",
+        label_visibility="collapsed",
     )
 
-    if categoria_sel:
-        if df_consumidores.empty:
-            st.info("No hay consumidores disponibles para el período seleccionado.")
+kpis = get_kpis_por_periodo(periodo_sql)
+total_facturado = kpis['total_facturado']
+sin_datos = sin_datos_periodo(total_facturado)
+importe_neto_energia = kpis['importe_neto_energia']
+importe_otros_conceptos = kpis['importe_otros_conceptos']
+consumo_kwh_real = kpis['consumo_kwh_real']
+
+with kpi_total:
+    st.metric("Total Facturado", f"${total_facturado:,.0f}")
+with kpi_neto:
+    st.metric("Importe Neto Energía", f"${importe_neto_energia:,.0f}")
+with kpi_otros:
+    st.metric("Importe Otros Conceptos", f"${importe_otros_conceptos:,.0f}")
+with kpi_kwh:
+    st.metric("kW Total Distribuidos", f"{consumo_kwh_real:,.0f}")
+
+if sin_datos:
+    left_col, right_col = st.columns(2)
+    with left_col:
+        st.markdown(
+            "<p class='inet-section-title'>Distribución de Facturación por Servicios</p>",
+            unsafe_allow_html=True,
+        )
+        st.info(NO_RECORDS_MESSAGE)
+    with right_col:
+        st.markdown(
+            "<p class='inet-section-title'>Distribución de Facturación por Tarifa Base</p>",
+            unsafe_allow_html=True,
+        )
+        st.info(NO_RECORDS_MESSAGE)
+
+    st.markdown(
+        "<hr style='margin:0.35rem 0;border:0;border-top:1px solid rgba(127,127,127,0.25);' />",
+        unsafe_allow_html=True,
+    )
+    st.markdown("#### Top 10 Consumidores por Tarifa Base")
+    st.info(NO_RECORDS_MESSAGE)
+
+    st.markdown(
+        "<hr style='margin:0.35rem 0;border:0;border-top:1px solid rgba(127,127,127,0.25);' />",
+        unsafe_allow_html=True,
+    )
+    st.markdown("#### Correlación: Consumo kWh vs Costo Unitario Promedio")
+    st.info(NO_RECORDS_MESSAGE)
+
+    st.markdown(
+        "<hr style='margin:0.35rem 0;border:0;border-top:1px solid rgba(127,127,127,0.25);' />",
+        unsafe_allow_html=True,
+    )
+    st.markdown("#### Evolución de Total Facturado")
+    st.info(NO_RECORDS_MESSAGE)
+
+if not sin_datos:
+    # ── Gráficos de distribución ──────────────────────────────────────────────────
+    df_totalizado_tarifa = get_facturacion_por_tarifa_base(periodo_sql)
+
+    left_col, right_col = st.columns(2)
+
+    with left_col:
+        st.markdown(
+            "<p class='inet-section-title'>Distribución de Facturación por Servicios</p>",
+            unsafe_allow_html=True,
+        )
+        df_kpi_serv = kpis.get('detalle_servicios', pd.DataFrame())
+        if not df_kpi_serv.empty:
+            df_serv = df_kpi_serv[df_kpi_serv['total_facturado'] > 0].sort_values(
+                by='total_facturado', ascending=False
+            )
+            if len(df_serv) > top_n_tarifas:
+                top_serv = df_serv.head(top_n_tarifas)
+                otros_serv = pd.DataFrame({
+                    'nombre_servicio': ['Otros'],
+                    'total_facturado': [df_serv.iloc[top_n_tarifas:]['total_facturado'].sum()],
+                })
+                df_serv = pd.concat([top_serv, otros_serv], ignore_index=True)
+            df_serv['label'] = df_serv['nombre_servicio'].apply(normalize_label)
+            html_donut = _build_interactive_pie_html(
+                df_serv, 'label', 'total_facturado',
+                px.colors.qualitative.Pastel, 'pie-energia-serv', hole=0.45,
+                height=DIST_CHART_HEIGHT,
+            )
+            components.html(html_donut, height=DIST_CHART_HEIGHT, scrolling=False)
         else:
-            df_plot = df_consumidores[df_consumidores['tarifa_base'] == categoria_sel].copy()
-            if df_plot.empty:
-                st.info(f"No hay consumidores para la tarifa base '{categoria_sel}' en el período seleccionado.")
+            st.info("No hay datos de servicios para el período seleccionado.")
+
+    with right_col:
+        st.markdown(
+            "<p class='inet-section-title'>Distribución de Facturación por Tarifa Base</p>",
+            unsafe_allow_html=True,
+        )
+        if not df_totalizado_tarifa.empty:
+            df_tarifa = df_totalizado_tarifa[
+                df_totalizado_tarifa['total_facturado'] > 0
+            ].sort_values(by='total_facturado', ascending=False).copy()
+            if len(df_tarifa) > top_n_tarifas:
+                top_tb = df_tarifa.head(top_n_tarifas)
+                otros_tb = pd.DataFrame({
+                    'tarifa_base': ['Otros'],
+                    'total_facturado': [df_tarifa.iloc[top_n_tarifas:]['total_facturado'].sum()],
+                })
+                df_tarifa = pd.concat([top_tb, otros_tb], ignore_index=True)
+            df_tarifa['label'] = df_tarifa['tarifa_base'].apply(normalize_label)
+            html_pie = _build_interactive_pie_html(
+                df_tarifa, 'label', 'total_facturado',
+                px.colors.qualitative.Set3, 'pie-energia-tarifa', hole=0,
+                height=DIST_CHART_HEIGHT,
+            )
+            components.html(html_pie, height=DIST_CHART_HEIGHT, scrolling=False)
+        else:
+            st.info("No hay datos de tarifa base para el período seleccionado.")
+
+    st.markdown(
+        "<hr style='margin:0.35rem 0;border:0;border-top:1px solid rgba(127,127,127,0.25);' />",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("#### Top 10 Consumidores por Tarifa Base")
+
+    df_consumidores = get_consumidores_por_periodo(periodo_sql)
+
+    if not df_totalizado_tarifa.empty:
+        categorias_top10 = df_totalizado_tarifa['tarifa_base'].tolist()
+        st.markdown("<span class='inet-filter-label'>Tarifa Base</span>", unsafe_allow_html=True)
+        categoria_sel = st.selectbox(
+            "Tarifa Base",
+            options=categorias_top10,
+            key="top10_categoria",
+            label_visibility="collapsed",
+        )
+
+        if categoria_sel:
+            if df_consumidores.empty:
+                st.info("No hay consumidores disponibles para el período seleccionado.")
             else:
-                df_plot['consumidor'] = (
-                    df_plot['nro_socio'].astype(str) + ' - ' + df_plot['nombre_socio'].fillna('')
-                )
+                df_plot = df_consumidores[df_consumidores['tarifa_base'] == categoria_sel].copy()
+                if df_plot.empty:
+                    st.info(f"No hay consumidores para la tarifa base '{categoria_sel}' en el período seleccionado.")
+                else:
+                    df_plot['consumidor'] = (
+                        df_plot['nro_socio'].astype(str) + ' - ' + df_plot['nombre_socio'].fillna('')
+                    )
 
-                df_top10_barras = df_plot.nlargest(10, 'consumo_kwh_real').copy()
-                y_order = df_top10_barras.sort_values(by='consumo_kwh_real', ascending=True)['consumidor'].tolist()
-                df_top10_barras['consumidor'] = pd.Categorical(
-                    df_top10_barras['consumidor'],
-                    categories=y_order,
-                    ordered=True,
-                )
+                    df_top10_barras = df_plot.nlargest(10, 'consumo_kwh_real').copy()
+                    y_order = df_top10_barras.sort_values(by='consumo_kwh_real', ascending=True)['consumidor'].tolist()
+                    df_top10_barras['consumidor'] = pd.Categorical(
+                        df_top10_barras['consumidor'],
+                        categories=y_order,
+                        ordered=True,
+                    )
 
-                fig_top10_bar = px.bar(
-                    df_top10_barras,
+                    fig_top10_bar = px.bar(
+                        df_top10_barras,
+                        x='consumo_kwh_real',
+                        y='consumidor',
+                        color='tarifa_base',
+                        orientation='h',
+                        text='consumo_kwh_real',
+                        custom_data=['importe_neto_energia', 'tarifa_base', 'cantidad_facturas'],
+                    )
+                    fig_top10_bar.update_traces(
+                        texttemplate='%{text:,.0f}',
+                        textposition='outside',
+                        hovertemplate=(
+                            '<b>%{y}</b><br>'
+                            'Categoría: %{customdata[1]}<br>'
+                            'Facturas: %{customdata[2]:,.0f}<br>'
+                            'Consumo: %{x:,.0f} kWh<br>'
+                            'Importe Neto Energía: $%{customdata[0]:,.0f}<extra></extra>'
+                        ),
+                    )
+                    fig_top10_bar.update_layout(
+                        height=DIST_CHART_HEIGHT,
+                        margin=dict(t=8, b=0, l=0, r=0),
+                        xaxis_title='Consumo kWh Real',
+                        yaxis_title='Consumidor',
+                        yaxis={'categoryorder': 'array', 'categoryarray': y_order},
+                        legend_title_text='Tarifa Base',
+                        showlegend=False,
+                    )
+                    st.plotly_chart(fig_top10_bar, width='stretch')
+        else:
+            st.info("Seleccione una categoría para ver el Top 10.")
+    else:
+        st.info("No hay datos disponibles para el Top 10 del período seleccionado.")
+
+    st.markdown(
+        "<hr style='margin:0.35rem 0;border:0;border-top:1px solid rgba(127,127,127,0.25);' />",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("#### Correlación: Consumo kWh vs Costo Unitario Promedio")
+
+    df_consumidores_corr = get_detalle_correlacion_por_periodo(periodo_sql)
+
+    if not df_consumidores_corr.empty:
+        if 'corr_segmentar_por_tarifa_base' not in st.session_state:
+            st.session_state['corr_segmentar_por_tarifa_base'] = False
+
+        usar_tarifa_base = st.session_state['corr_segmentar_por_tarifa_base']
+        etiqueta_segmentacion = 'Tarifa Base' if usar_tarifa_base else 'Escalón Asignado'
+        campo_segmentacion = 'tarifa_base' if usar_tarifa_base else 'escalon_asignado'
+
+        boton_segmentacion = (
+            "Cambiar a Escalón Asignado" if usar_tarifa_base else "Cambiar a Tarifa Base"
+        )
+        if st.button(boton_segmentacion, key='corr_toggle_segmentacion'):
+            st.session_state['corr_segmentar_por_tarifa_base'] = not usar_tarifa_base
+            st.rerun()
+
+        if usar_tarifa_base:
+            df_tarifas_corr = get_facturacion_por_tarifa_base(periodo_sql)
+            if not df_tarifas_corr.empty:
+                categorias_corr = df_tarifas_corr['tarifa_base'].tolist()
+            else:
+                categorias_corr = sorted(df_consumidores_corr['tarifa_base'].dropna().unique().tolist())
+        else:
+            categorias_corr = (
+                df_consumidores_corr.groupby(campo_segmentacion, dropna=True)
+                .size()
+                .sort_values(ascending=False)
+                .index.tolist()
+            )
+        categorias_corr = [c for c in categorias_corr if not str(c).lower().startswith('sin ')]
+
+        _defaults_corr = {
+            'tarifa_base':      'Residencial c/Subs < 500',
+            'escalon_asignado': 'Residencial c/Subs < 500',
+        }
+        _default_corr = _defaults_corr.get(campo_segmentacion, '')
+        _default_corr_idx = (
+            categorias_corr.index(_default_corr)
+            if _default_corr in categorias_corr
+            else 0
+        )
+        st.markdown(f"<span class='inet-filter-label'>{etiqueta_segmentacion}</span>", unsafe_allow_html=True)
+        categoria_corr_sel = st.selectbox(
+            etiqueta_segmentacion,
+            options=categorias_corr,
+            index=_default_corr_idx,
+            key=f"corr_categoria_{campo_segmentacion}",
+            label_visibility="collapsed",
+        )
+
+        if categoria_corr_sel:
+            df_corr = df_consumidores_corr[
+                df_consumidores_corr[campo_segmentacion] == categoria_corr_sel
+            ].copy()
+            df_corr['consumidor'] = (
+                df_corr['nro_socio'].astype(str) + ' - ' + df_corr['nombre_socio'].fillna('')
+            )
+            df_corr = df_corr[
+                (df_corr['consumo_kwh_real'] > 0)
+                & (df_corr['promedio_energia_pura'] > 0)
+            ].copy()
+
+            if not df_corr.empty:
+                st.caption(f"Registros graficados: {len(df_corr):,}")
+                fig_corr = px.scatter(
+                    df_corr,
                     x='consumo_kwh_real',
-                    y='consumidor',
-                    color='tarifa_base',
-                    orientation='h',
-                    text='consumo_kwh_real',
-                    custom_data=['importe_neto_energia', 'tarifa_base', 'cantidad_facturas'],
+                    y='promedio_energia_pura',
+                    hover_name='consumidor',
+                    custom_data=[
+                        'importe_neto_energia',
+                        'nro_factura',
+                        campo_segmentacion,
+                        'promedio_energia_pura',
+                    ],
+                    labels={
+                        'consumo_kwh_real': 'Consumo kWh Real',
+                        'promedio_energia_pura': 'Promedio Energía Pura ($/kWh)',
+                    },
                 )
-                fig_top10_bar.update_traces(
-                    texttemplate='%{text:,.0f}',
-                    textposition='outside',
+                fig_corr.update_traces(
+                    marker=dict(size=7, opacity=0.55, line=dict(width=0.5, color='rgba(120,120,120,0.45)')),
                     hovertemplate=(
-                        '<b>%{y}</b><br>'
-                        'Categoría: %{customdata[1]}<br>'
-                        'Facturas: %{customdata[2]:,.0f}<br>'
+                        '<b>%{hovertext}</b><br>'
+                        f'{etiqueta_segmentacion}: %{{customdata[2]}}<br>'
+                        'Nro Factura: %{customdata[1]}<br>'
                         'Consumo: %{x:,.0f} kWh<br>'
+                        'Promedio Energía Pura: $%{customdata[3]:,.2f}<br>'
                         'Importe Neto Energía: $%{customdata[0]:,.0f}<extra></extra>'
                     ),
                 )
-                fig_top10_bar.update_layout(
-                    margin=dict(t=10, b=0, l=0, r=0),
+                fig_corr.update_layout(
+                    height=DIST_CHART_HEIGHT,
+                    margin=dict(t=8, b=0, l=0, r=0),
                     xaxis_title='Consumo kWh Real',
-                    yaxis_title='Consumidor',
-                    yaxis={'categoryorder': 'array', 'categoryarray': y_order},
-                    legend_title_text='Tarifa Base',
+                    yaxis_title='Promedio Energía Pura ($/kWh)',
+                    showlegend=False,
                 )
-                st.plotly_chart(fig_top10_bar, width='stretch')
-    else:
-        st.info("Seleccione una categoría para ver el Top 10.")
-else:
-    st.info("No hay datos disponibles para el Top 10 del período seleccionado.")
-
-st.markdown(
-    "<hr style='margin:0.35rem 0;border:0;border-top:1px solid rgba(127,127,127,0.25);' />",
-    unsafe_allow_html=True,
-)
-
-st.subheader("Correlación: Consumo kWh vs Costo Unitario Promedio")
-
-df_consumidores_corr = get_detalle_correlacion_por_periodo(periodo_sql)
-
-if not df_consumidores_corr.empty:
-    if 'corr_segmentar_por_tarifa_base' not in st.session_state:
-        st.session_state['corr_segmentar_por_tarifa_base'] = False
-
-    usar_tarifa_base = st.session_state['corr_segmentar_por_tarifa_base']
-    etiqueta_segmentacion = 'Tarifa Base' if usar_tarifa_base else 'Escalón Asignado'
-    campo_segmentacion = 'tarifa_base' if usar_tarifa_base else 'escalon_asignado'
-
-    boton_segmentacion = (
-        "Cambiar a Escalón Asignado" if usar_tarifa_base else "Cambiar a Tarifa Base"
-    )
-    if st.button(boton_segmentacion, key='corr_toggle_segmentacion'):
-        st.session_state['corr_segmentar_por_tarifa_base'] = not usar_tarifa_base
-        st.rerun()
-
-    if usar_tarifa_base:
-        df_tarifas_corr = get_facturacion_por_tarifa_base(periodo_sql)
-        if not df_tarifas_corr.empty:
-            categorias_corr = df_tarifas_corr['tarifa_base'].tolist()
+                st.plotly_chart(fig_corr, width='stretch')
+            else:
+                st.info(
+                    f"No hay datos con consumo/promedio > 0 para calcular la correlación en la {etiqueta_segmentacion.lower()} seleccionada."
+                )
         else:
-            categorias_corr = sorted(df_consumidores_corr['tarifa_base'].dropna().unique().tolist())
+            st.info(f"Seleccione una {etiqueta_segmentacion.lower()} para ver la correlación.")
     else:
-        categorias_corr = (
-            df_consumidores_corr.groupby(campo_segmentacion, dropna=True)
-            .size()
-            .sort_values(ascending=False)
-            .index.tolist()
-        )
-    categorias_corr = [c for c in categorias_corr if not str(c).lower().startswith('sin ')]
+        st.info("No hay datos disponibles para la sección de correlación en el período seleccionado.")
 
-    _defaults_corr = {
-        'tarifa_base':      'Residencial c/Subs < 500',
-        'escalon_asignado': 'Residencial c/Subs < 500',
-    }
-    _default_corr = _defaults_corr.get(campo_segmentacion, '')
-    _default_corr_idx = (
-        categorias_corr.index(_default_corr)
-        if _default_corr in categorias_corr
-        else 0
+    st.markdown(
+        "<hr style='margin:0.35rem 0;border:0;border-top:1px solid rgba(127,127,127,0.25);' />",
+        unsafe_allow_html=True,
     )
-    categoria_corr_sel = st.selectbox(
-        f"{etiqueta_segmentacion}:",
-        options=categorias_corr,
-        index=_default_corr_idx,
-        key=f"corr_categoria_{campo_segmentacion}",
+    st.markdown("#### Evolución de Total Facturado")
+    meses_total = st.number_input(
+        "Meses a comparar (total):",
+        min_value=MESES_EVOLUCION_MIN,
+        max_value=MESES_EVOLUCION_MAX,
+        value=MESES_EVOLUCION_DEFAULT,
+        step=1,
+        key="meses_evolucion_total",
     )
-
-    if categoria_corr_sel:
-        df_corr = df_consumidores_corr[
-            df_consumidores_corr[campo_segmentacion] == categoria_corr_sel
-        ].copy()
-        df_corr['consumidor'] = (
-            df_corr['nro_socio'].astype(str) + ' - ' + df_corr['nombre_socio'].fillna('')
-        )
-        df_corr = df_corr[
-            (df_corr['consumo_kwh_real'] > 0)
-            & (df_corr['promedio_energia_pura'] > 0)
-        ].copy()
-
-        if not df_corr.empty:
-            st.caption(f"Registros graficados: {len(df_corr):,}")
-            fig_corr = px.scatter(
-                df_corr,
-                x='consumo_kwh_real',
-                y='promedio_energia_pura',
-                hover_name='consumidor',
-                custom_data=[
-                    'importe_neto_energia',
-                    'nro_factura',
-                    campo_segmentacion,
-                    'promedio_energia_pura',
-                ],
-                labels={
-                    'consumo_kwh_real': 'Consumo kWh Real',
-                    'promedio_energia_pura': 'Promedio Energía Pura ($/kWh)',
-                },
-            )
-            fig_corr.update_traces(
-                marker=dict(size=7, opacity=0.55, line=dict(width=0.5, color='rgba(120,120,120,0.45)')),
-                hovertemplate=(
-                    '<b>%{hovertext}</b><br>'
-                    f'{etiqueta_segmentacion}: %{{customdata[2]}}<br>'
-                    'Nro Factura: %{customdata[1]}<br>'
-                    'Consumo: %{x:,.0f} kWh<br>'
-                    'Promedio Energía Pura: $%{customdata[3]:,.2f}<br>'
-                    'Importe Neto Energía: $%{customdata[0]:,.0f}<extra></extra>'
-                ),
-            )
-            fig_corr.update_layout(
-                margin=dict(t=10, b=0, l=0, r=0),
-                xaxis_title='Consumo kWh Real',
-                yaxis_title='Promedio Energía Pura ($/kWh)',
-                showlegend=False,
-            )
-            st.plotly_chart(fig_corr, width='stretch')
-        else:
-            st.info(
-                f"No hay datos con consumo/promedio > 0 para calcular la correlación en la {etiqueta_segmentacion.lower()} seleccionada."
-            )
+    periodos_total = get_periodos_evolucion(periodos_sorted, periodo_sql, meses_total)
+    df_total_hist = historico_desde_getter(
+        periodos_total,
+        lambda p: get_kpis_por_periodo(p)["total_facturado"],
+    )
+    if df_total_hist.empty or float(df_total_hist["total_facturado"].sum()) <= 0:
+        st.info("No hay datos históricos de total facturado.")
     else:
-        st.info(f"Seleccione una {etiqueta_segmentacion.lower()} para ver la correlación.")
-else:
-    st.info("No hay datos disponibles para la sección de correlación en el período seleccionado.")
+        fig_total = build_evolucion_total_fig(df_total_hist, height=DIST_CHART_HEIGHT)
+        st.plotly_chart(fig_total, width="stretch")
+
