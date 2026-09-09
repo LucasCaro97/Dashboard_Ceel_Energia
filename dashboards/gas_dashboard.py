@@ -11,7 +11,7 @@ import os
 
 from common.periods import fetch_periodos_disponibles
 from common.empty_state import NO_RECORDS_MESSAGE, sin_datos_periodo
-from common.evolucion_facturado import build_evolucion_total_fig, historico_desde_getter
+from common.evolucion_facturado import build_evolucion_total_fig, fetch_totales_por_periodos
 
 try:
     from streamlit_echarts import st_echarts
@@ -23,8 +23,9 @@ try:
 except ImportError:
     load_dotenv = None
 
+
 # 1. Configuración de página
-st.set_page_config(page_title="Dashboard Internet - CEEL", layout="wide")
+st.set_page_config(page_title="Dashboard Gas - CEEL", layout="wide")
 
 # 2. Constantes
 TOP_N_TARIFAS_DEFAULT = 6
@@ -35,7 +36,13 @@ DIST_CHART_HEIGHT = 360
 PIE_DOMAIN_X = (0.0, 0.58)
 PIE_DOMAIN_Y = (0.02, 0.98)
 PIE_CENTER_X = (PIE_DOMAIN_X[0] + PIE_DOMAIN_X[1]) / 2
-SERVICIO_TIPO  = "internet"
+
+# `facturacion_conceptos.servicio` debe coincidir con `servicios.nombre_servicio`
+SERVICIO_FC = "GAS ENVASADO"
+
+# Para consultar conceptos por servicio usamos LOWER(s.nombre_servicio)
+SERVICIO_CONCEPT_QUERY = "gas envasado"
+
 
 # 3. Motor de conexión
 if load_dotenv is not None:
@@ -95,61 +102,72 @@ def get_periodos_evolucion(periodos, periodo_fin, cantidad_meses):
     return [p.strftime("%Y-%m-%d") for p in periodos_dt.tail(int(cantidad_meses))]
 
 
-# 5. Funciones de carga (todas cacheadas)
-
+# 5. Funciones de carga (cacheadas)
 @st.cache_data
 def get_periodos_disponibles():
-    return fetch_periodos_disponibles(engine)
-
-
-@st.cache_data
-def get_kpi_por_sector_sp(periodo):
-    """KPIs del período desde sp_kpi_por_sector(sector, periodo)."""
-    if not periodo:
-        return None
     try:
-        with engine.connect() as conn:
-            result = conn.execute(
-                text("CALL sp_kpi_por_sector(:sector, :periodo)"),
-                {"sector": SERVICIO_TIPO, "periodo": periodo},
-            )
-            rows = result.fetchall()
-            cols = list(result.keys())
-        if not rows:
-            return None
-        return dict(zip(cols, rows[0]))
+        query = text(
+            """
+            SELECT periodo
+            FROM conecciones_energia.facturacion_conceptos
+            WHERE periodo IS NOT NULL
+              AND servicio = :servicio
+            GROUP BY periodo
+            ORDER BY periodo DESC
+            """
+        )
+        df_periodos = pd.read_sql(query, engine, params={"servicio": SERVICIO_FC})
+        if df_periodos is None or df_periodos.empty:
+            return []
+        periodos = pd.to_datetime(df_periodos["periodo"], errors="coerce").dropna()
+        return periodos.dt.strftime("%Y-%m-%d").tolist()
     except Exception:
-        return None
+        return fetch_periodos_disponibles(engine)
 
 
 @st.cache_data
-def get_total_facturado_sp(periodo):
-    """Total facturado para el período, obtenido desde sp_kpi_por_sector."""
-    kpi = get_kpi_por_sector_sp(periodo)
-    if not kpi:
+def get_total_facturado(periodo):
+    """Total facturado del período para Gas (solo servicio GAS ENVASADO)."""
+    if not periodo:
         return 0.0
-    val = pd.to_numeric(kpi.get("total_facturado"), errors="coerce")
-    return float(val) if pd.notna(val) else 0.0
+    try:
+        df = pd.read_sql(
+            text(
+                """
+                SELECT COALESCE(SUM(total), 0) AS total_facturado
+                FROM conecciones_energia.facturacion_conceptos
+                WHERE periodo = :periodo
+                  AND servicio = :servicio
+                """
+            ),
+            engine,
+            params={"periodo": periodo, "servicio": SERVICIO_FC},
+        )
+        val = pd.to_numeric(df.iloc[0]["total_facturado"], errors="coerce")
+        return float(val) if pd.notna(val) else 0.0
+    except Exception:
+        return 0.0
 
 
 @st.cache_data
 def get_cantidad_facturas(periodo):
-    """Cantidad de facturas: prioriza sp_kpi_por_sector, fallback fn_contar_facturas_internet."""
+    """Cantidad de facturas emitidas en el período."""
     if not periodo:
         return 0
-    kpi = get_kpi_por_sector_sp(periodo)
-    if kpi and kpi.get("cantidad_facturas") is not None:
-        val = pd.to_numeric(kpi.get("cantidad_facturas"), errors="coerce")
-        if pd.notna(val):
-            return int(val)
     try:
         df = pd.read_sql(
-            text("SELECT fn_contar_facturas_internet(:periodo) AS total_facturas"),
+            text(
+                """
+                SELECT COUNT(DISTINCT nro_factura) AS total_facturas
+                FROM conecciones_energia.facturacion_conceptos
+                WHERE periodo = :periodo
+                  AND servicio = :servicio
+                  AND COALESCE(nro_factura, '') <> ''
+                """
+            ),
             engine,
-            params={"periodo": periodo},
+            params={"periodo": periodo, "servicio": SERVICIO_FC},
         )
-        if df is None or df.empty:
-            return 0
         val = pd.to_numeric(df.iloc[0]["total_facturas"], errors="coerce")
         return int(val) if pd.notna(val) else 0
     except Exception:
@@ -157,8 +175,53 @@ def get_cantidad_facturas(periodo):
 
 
 @st.cache_data
+def get_conceptos_servicio_nombres():
+    """
+    Conceptos de gas marcados como servicio (es_consumo_total=1).
+    Usado para excluir IVA/percepciones/etc en ranking/barras y evolución.
+    """
+    try:
+        df = pd.read_sql(
+            text(
+                """
+                SELECT cm.nombre_concepto
+                FROM conecciones_energia.conceptos_maestro cm
+                JOIN conecciones_energia.servicios s
+                  ON s.id_servicio = CAST(cm.servicio AS UNSIGNED)
+                WHERE LOWER(s.nombre_servicio) = :sector
+                  AND cm.es_consumo_total = 1
+                """
+            ),
+            engine,
+            params={"sector": SERVICIO_CONCEPT_QUERY},
+        )
+        if df is None or df.empty:
+            return frozenset()
+        nombres = (
+            df["nombre_concepto"]
+            .astype(str)
+            .str.strip()
+            .replace("", pd.NA)
+            .dropna()
+            .tolist()
+        )
+        return frozenset(nombres)
+    except Exception:
+        return frozenset()
+
+
+def _filtrar_conceptos_servicio(df):
+    if df is None or df.empty or "nombre_concepto" not in df.columns:
+        return pd.DataFrame(columns=["nombre_concepto", "cantidad", "total"])
+    allowed = get_conceptos_servicio_nombres()
+    if not allowed:
+        return df.iloc[0:0].copy()
+    return df[df["nombre_concepto"].isin(allowed)].copy()
+
+
+@st.cache_data
 def get_ranking_servicios_por_periodo(periodo):
-    """Ranking de servicios facturados por período desde sp_ranking_servicios_por_periodo."""
+    """Ranking de conceptos de gas facturados por período (sin impuestos)."""
     cols = ["nombre_concepto", "cantidad", "total"]
     if not periodo:
         return pd.DataFrame(columns=cols)
@@ -166,7 +229,7 @@ def get_ranking_servicios_por_periodo(periodo):
         with engine.connect() as conn:
             result = conn.execute(
                 text("CALL sp_ranking_servicios_por_periodo(:periodo, :sector)"),
-                {"periodo": periodo, "sector": SERVICIO_TIPO},
+                {"periodo": periodo, "sector": SERVICIO_FC},
             )
             rows = result.fetchall()
             sp_cols = list(result.keys())
@@ -180,6 +243,7 @@ def get_ranking_servicios_por_periodo(periodo):
         )
         df["cantidad"] = pd.to_numeric(df["cantidad"], errors="coerce").fillna(0).astype(int)
         df["total"] = pd.to_numeric(df["total"], errors="coerce").fillna(0.0)
+        df = _filtrar_conceptos_servicio(df)
         return df[df["total"] > 0].sort_values("total", ascending=False).reset_index(drop=True)[cols]
     except Exception:
         return pd.DataFrame(columns=cols)
@@ -187,7 +251,7 @@ def get_ranking_servicios_por_periodo(periodo):
 
 @st.cache_data
 def get_ranking_servicios_historico(periodos):
-    """Cantidad de usuarios por servicio para cada período (vía SP)."""
+    """Cantidad de usuarios por concepto para cada período."""
     cols = ["periodo", "nombre_concepto", "cantidad"]
     if not periodos:
         return pd.DataFrame(columns=cols)
@@ -207,7 +271,7 @@ def get_ranking_servicios_historico(periodos):
 
 
 def _prepare_usuarios_pivot(df_hist, top_n):
-    """Prepara pivot de cantidad por período y servicio."""
+    """Prepara pivot de cantidad por período y concepto de servicio."""
     if df_hist is None or df_hist.empty:
         return None
 
@@ -218,7 +282,6 @@ def _prepare_usuarios_pivot(df_hist, top_n):
         return None
 
     periodos = sorted(df["periodo"].unique())
-    periodo_labels = [pd.Timestamp(p).strftime("%m-%Y") for p in periodos]
 
     top_servicios = (
         df.groupby("nombre_concepto")["cantidad"]
@@ -246,87 +309,8 @@ def _prepare_usuarios_pivot(df_hist, top_n):
     return {
         "pivot": pivot,
         "periodos": periodos,
-        "periodo_labels": periodo_labels,
         "stack_order": stack_order,
         "legend_data": legend_data,
-    }
-
-
-def _chunk_legend_rows(legend_data, max_chars_per_row=42):
-    """Agrupa ítems de leyenda en filas según ancho estimado del texto."""
-    rows, current, current_len = [], [], 0
-    for name in legend_data:
-        item_len = len(str(name)) + 6
-        if current and current_len + item_len > max_chars_per_row:
-            rows.append(current)
-            current, current_len = [name], item_len
-        else:
-            current.append(name)
-            current_len += item_len
-    if current:
-        rows.append(current)
-    return rows
-
-
-def _build_wrapped_legends(legend_data, legend_selected=None):
-    """Varias leyendas apiladas para simular salto de línea sin scroll."""
-    if legend_selected is None:
-        legend_selected = {name: True for name in legend_data}
-
-    rows = _chunk_legend_rows(legend_data)
-    row_height = 24
-    legends = []
-    for row_idx, chunk in enumerate(rows):
-        legends.append({
-            "data": chunk,
-            "type": "plain",
-            "orient": "horizontal",
-            "left": "center",
-            "bottom": row_idx * row_height,
-            "itemGap": 12,
-            "textStyle": {"fontSize": 11},
-            "selected": {name: legend_selected.get(name, True) for name in chunk},
-        })
-    legend_height = len(rows) * row_height + 10
-    return legends, legend_height
-
-
-def _build_usuarios_area_options(pivot, periodos, stack_order, legend_data, legend_selected=None):
-    """Opciones ECharts para área apilada de cantidad de usuarios por servicio."""
-    periodo_labels = [pd.Timestamp(p).strftime("%m-%Y") for p in periodos]
-
-    series = [
-        {
-            "name": name,
-            "type": "line",
-            "stack": "Total",
-            "areaStyle": {},
-            "emphasis": {"focus": "series"},
-            "data": [int(pivot.loc[p, name]) for p in periodos],
-        }
-        for name in stack_order
-    ]
-
-    legends, legend_height = _build_wrapped_legends(legend_data, legend_selected)
-
-    return {
-        "title": {"text": "Usuarios por Servicio", "left": "center", "top": 4, "textStyle": {"fontSize": 14}},
-        "tooltip": {
-            "trigger": "axis",
-            "axisPointer": {"type": "cross", "label": {"backgroundColor": "#6a7985"}},
-        },
-        "legend": legends,
-        "toolbox": {"feature": {"saveAsImage": {}}},
-        "grid": {"left": 16, "right": 12, "top": 40, "bottom": legend_height, "containLabel": True},
-        "xAxis": [
-            {
-                "type": "category",
-                "boundaryGap": False,
-                "data": periodo_labels,
-            }
-        ],
-        "yAxis": [{"type": "value", "name": "Cantidad de usuarios"}],
-        "series": series,
     }
 
 
@@ -439,18 +423,19 @@ def _apply_legend_selection(legend_names, raw_chart_state=None):
 
 @st.cache_data
 def get_facturacion_por_tarifa(periodo):
-    """Facturación por tarifa desde sp_consolidado_internet_por_periodo."""
+    """Distribución por tarifa desde sp_consolidado_gas_por_periodo."""
     cols = ["tarifa_aplicada", "total_facturado", "cantidad_socios"]
     if not periodo:
         return pd.DataFrame(columns=cols)
     try:
         with engine.connect() as conn:
             result = conn.execute(
-                text("CALL sp_consolidado_internet_por_periodo(:periodo)"),
+                text("CALL sp_consolidado_gas_por_periodo(:periodo)"),
                 {"periodo": periodo},
             )
             rows = result.fetchall()
             sp_cols = list(result.keys())
+
         if not rows:
             return pd.DataFrame(columns=cols)
 
@@ -477,9 +462,7 @@ def get_facturacion_por_tarifa(periodo):
 
 
 # ─── Utilidad: gráfico de torta/donut interactivo ─────────────────────────────
-
 def _build_interactive_pie_html(df_values, label_col, value_col, palette, chart_id, hole=0.45, height=DIST_CHART_HEIGHT):
-    """Genera el HTML de un pie/donut Plotly interactivo con leyenda sincronizada."""
     df_plot = df_values.copy()
     df_plot["label"] = df_plot[label_col].astype(str)
     colors = [palette[i % len(palette)] for i in range(len(df_plot))]
@@ -526,11 +509,11 @@ def _build_interactive_pie_html(df_values, label_col, value_col, palette, chart_
     colors_json = json.dumps(colors)
     percents_json = json.dumps([round(p, 1) for p in percents])
 
-    wrap_cls     = f"wrap-{chart_id}"
-    chart_div    = f"chart-{chart_id}"
-    leg_div      = f"legend-{chart_id}"
-    center_div   = f"center-{chart_id}"
-    chart_area   = f"chart-area-{chart_id}"
+    wrap_cls = f"wrap-{chart_id}"
+    chart_div = f"chart-{chart_id}"
+    leg_div = f"legend-{chart_id}"
+    center_div = f"center-{chart_id}"
+    chart_area = f"chart-area-{chart_id}"
 
     return fr"""
     <style>
@@ -555,73 +538,22 @@ def _build_interactive_pie_html(df_values, label_col, value_col, palette, chart_
             background:transparent;
             overflow:hidden;
         }}
-        #{chart_div} .main-svg{{
-            display:block;
-        }}
-        #{chart_div} .hoverlayer,
-        #{chart_div} .hovertext{{
-            display:none !important;
-            pointer-events:none !important;
-        }}
+        #{chart_div} .main-svg{{display:block;}}
+        #{chart_div} .hoverlayer,#{chart_div} .hovertext{{display:none !important;pointer-events:none !important;}}
         #{leg_div}{{
-            position:absolute;
-            top:8px;
-            right:8px;
-            left:auto;
-            z-index:10;
-            display:flex;
-            flex-direction:column;
-            gap:3px;
-            max-width:42%;
-            padding:6px 8px;
-            border-radius:6px;
-            background:rgba(255,255,255,0.82);
+            position:absolute;top:8px;right:8px;left:auto;z-index:10;display:flex;flex-direction:column;
+            gap:3px;max-width:42%;padding:6px 8px;border-radius:6px;background:rgba(255,255,255,0.82);
             box-shadow:0 1px 4px rgba(0,0,0,0.05);
         }}
         .legend-item:hover{{opacity:0.7;}}
-        .legend-label{{
-            font-size:0.72rem;
-            line-height:1.15;
-            color:#7d7d7d;
-            font-weight:500;
-            white-space:nowrap;
-            overflow:hidden;
-            text-overflow:ellipsis;
-        }}
-        .{chart_area}{{
-            position:relative;
-            width:100%;
-            height:{height}px;
-            overflow:hidden;
-        }}
+        .legend-label{{font-size:0.72rem;line-height:1.15;color:#7d7d7d;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
+        .{chart_area}{{position:relative;width:100%;height:{height}px;overflow:hidden;}}
         #{center_div}{{
-            position:absolute;
-            top:50%;
-            left:{PIE_CENTER_X * 100:.2f}%;
-            transform:translate(-50%, -50%);
-            z-index:20;
-            pointer-events:none;
-            text-align:center;
-            min-width:72px;
-            visibility:hidden;
+            position:absolute;top:50%;left:{PIE_CENTER_X * 100:.2f}%;transform:translate(-50%, -50%);
+            z-index:20;pointer-events:none;text-align:center;min-width:72px;visibility:hidden;
         }}
-        #{center_div}.visible{{
-            visibility:visible;
-        }}
-        .center-pct-{chart_id}{{
-            font-size:2.75rem;
-            font-weight:900;
-            line-height:1;
-            letter-spacing:-0.02em;
-            font-stretch:expanded;
-            color:#ffffff;
-            text-shadow:
-                -1px -1px 0 rgba(30,30,30,0.85),
-                 1px -1px 0 rgba(30,30,30,0.85),
-                -1px  1px 0 rgba(30,30,30,0.85),
-                 1px  1px 0 rgba(30,30,30,0.85),
-                 0    0   6px rgba(0,0,0,0.35);
-        }}
+        #{center_div}.visible{{visibility:visible;}}
+        .center-pct-{chart_id}{{font-size:2.75rem;font-weight:900;line-height:1;letter-spacing:-0.02em;color:#ffffff;text-shadow:-1px -1px 0 rgba(30,30,30,0.85),1px -1px 0 rgba(30,30,30,0.85),-1px  1px 0 rgba(30,30,30,0.85),1px  1px 0 rgba(30,30,30,0.85),0 0 6px rgba(0,0,0,0.35);}}
     </style>
     <div class="{wrap_cls}">
         <div id="{leg_div}">{legend_items}</div>
@@ -668,8 +600,7 @@ def _build_interactive_pie_html(df_values, label_col, value_col, palette, chart_
                     return;
                 }}
                 const pct = percents[idx];
-                centerEl.innerHTML =
-                    '<div class="center-pct-{chart_id}">' + pct.toFixed(1) + '%</div>';
+                centerEl.innerHTML = '<div class="center-pct-{chart_id}">' + pct.toFixed(1) + '%</div>';
                 centerEl.classList.add('visible');
             }}
 
@@ -738,8 +669,88 @@ def _build_interactive_pie_html(df_values, label_col, value_col, palette, chart_
     """
 
 
-# ─── 6. Interfaz ──────────────────────────────────────────────────────────────
+def _chunk_legend_rows(legend_data, max_chars_per_row=42):
+    """Agrupa ítems de leyenda en filas según ancho estimado del texto."""
+    rows, current, current_len = [], [], 0
+    for name in legend_data:
+        item_len = len(str(name)) + 6
+        if current and current_len + item_len > max_chars_per_row:
+            rows.append(current)
+            current, current_len = [name], item_len
+        else:
+            current.append(name)
+            current_len += item_len
+    if current:
+        rows.append(current)
+    return rows
 
+
+def _build_wrapped_legends(legend_data, legend_selected=None):
+    """Varias leyendas apiladas para simular salto de línea sin scroll."""
+    if legend_selected is None:
+        legend_selected = {name: True for name in legend_data}
+
+    rows = _chunk_legend_rows(legend_data)
+    row_height = 24
+    legends = []
+    for row_idx, chunk in enumerate(rows):
+        legends.append(
+            {
+                "data": chunk,
+                "type": "plain",
+                "orient": "horizontal",
+                "left": "center",
+                "bottom": row_idx * row_height,
+                "itemGap": 12,
+                "textStyle": {"fontSize": 11},
+                "selected": {name: legend_selected.get(name, True) for name in chunk},
+            }
+        )
+    legend_height = len(rows) * row_height + 10
+    return legends, legend_height
+
+
+def _build_usuarios_area_options(pivot, periodos, stack_order, legend_data, legend_selected=None):
+    """Opciones ECharts para área apilada de cantidad por servicio."""
+    periodos = list(periodos)
+    periodo_labels = [pd.Timestamp(p).strftime("%m-%Y") for p in periodos]
+
+    series = [
+        {
+            "name": name,
+            "type": "line",
+            "stack": "Total",
+            "areaStyle": {},
+            "emphasis": {"focus": "series"},
+            "data": [int(pivot.loc[p, name]) for p in periodos],
+        }
+        for name in stack_order
+    ]
+
+    legends, legend_height = _build_wrapped_legends(legend_data, legend_selected)
+
+    return {
+        "title": {"text": "Usuarios por Servicio", "left": "center", "top": 4, "textStyle": {"fontSize": 14}},
+        "tooltip": {
+            "trigger": "axis",
+            "axisPointer": {"type": "cross", "label": {"backgroundColor": "#6a7985"}},
+        },
+        "legend": legends,
+        "toolbox": {"feature": {"saveAsImage": {}}},
+        "grid": {"left": 16, "right": 12, "top": 40, "bottom": legend_height, "containLabel": True},
+        "xAxis": [
+            {
+                "type": "category",
+                "boundaryGap": False,
+                "data": periodo_labels,
+            }
+        ],
+        "yAxis": [{"type": "value", "name": "Cantidad de usuarios"}],
+        "series": series,
+    }
+
+
+# ─── 6. Interfaz ──────────────────────────────────────────────────────────────
 _COMPACT_LAYOUT_CSS = """
 <style>
     html {
@@ -841,13 +852,13 @@ _COMPACT_LAYOUT_CSS = """
 st.markdown(_COMPACT_LAYOUT_CSS, unsafe_allow_html=True)
 
 st.markdown(
-    "<h3 style='margin:0 0 0.35rem 0;line-height:1.2;'>🌐 Dashboard de Facturación - CEEL INTERNET</h3>",
+    "<h3 style='margin:0 0 0.35rem 0;line-height:1.2;'>🔥 Dashboard de Facturación - CEEL GAS</h3>",
     unsafe_allow_html=True,
 )
 
 periodos_sorted = get_periodos_disponibles()
 if not periodos_sorted:
-    periodos_sorted = ["2026-05-01"]
+    periodos_sorted = ["2026-01-01"]
 
 filt_periodo, filt_top_n, kpi_total, kpi_facturas = st.columns([1.5, 0.85, 1.325, 1.325], gap="small")
 
@@ -873,7 +884,7 @@ with filt_top_n:
         label_visibility="collapsed",
     )
 
-total_facturado = get_total_facturado_sp(periodo_sql)
+total_facturado = get_total_facturado(periodo_sql)
 sin_datos = sin_datos_periodo(total_facturado)
 if sin_datos:
     cantidad_facturas = 0
@@ -891,7 +902,7 @@ if sin_datos:
         st.markdown("<p class='inet-section-title'>Distribución por Tarifa Usuario</p>", unsafe_allow_html=True)
         st.info(NO_RECORDS_MESSAGE)
     with right_col:
-        st.markdown("<p class='inet-section-title'>Total Facturado por Servicios</p>", unsafe_allow_html=True)
+        st.markdown("<p class='inet-section-title'>Total Facturado por Servicios (sin impuestos)</p>", unsafe_allow_html=True)
         st.info(NO_RECORDS_MESSAGE)
 
     st.markdown(
@@ -920,14 +931,14 @@ if not sin_datos:
         if not df_tarifas.empty:
             df_chart = df_tarifas.copy()
             if len(df_chart) > top_n_tarifas:
-                top_part  = df_chart.head(top_n_tarifas)
+                top_part = df_chart.head(top_n_tarifas)
                 otros_val = df_chart.iloc[top_n_tarifas:]["total_facturado"].sum()
                 otros_row = pd.DataFrame({"tarifa_aplicada": ["Otros"], "total_facturado": [otros_val], "cantidad_socios": [0]})
-                df_chart  = pd.concat([top_part, otros_row], ignore_index=True)
+                df_chart = pd.concat([top_part, otros_row], ignore_index=True)
 
             html_pie = _build_interactive_pie_html(
                 df_chart, "tarifa_aplicada", "total_facturado",
-                px.colors.qualitative.Set3, "pie-inet", hole=0.45,
+                px.colors.qualitative.Set3, "pie-gas", hole=0.45,
                 height=DIST_CHART_HEIGHT,
             )
             components.html(html_pie, height=DIST_CHART_HEIGHT, scrolling=False)
@@ -935,17 +946,19 @@ if not sin_datos:
             st.info("No hay datos de tarifas para el período seleccionado.")
 
     with right_col:
-        st.markdown("<p class='inet-section-title'>Total Facturado por Servicios</p>", unsafe_allow_html=True)
+        st.markdown("<p class='inet-section-title'>Total Facturado por Servicios (sin impuestos)</p>", unsafe_allow_html=True)
         if not df_servicios.empty:
             df_bars = df_servicios.copy()
             if len(df_bars) > top_n_tarifas:
-                top_part  = df_bars.head(top_n_tarifas)
+                top_part = df_bars.head(top_n_tarifas)
                 otros_val = df_bars.iloc[top_n_tarifas:]["total"].sum()
                 otros_cant = df_bars.iloc[top_n_tarifas:]["cantidad"].sum()
-                otros_row = pd.DataFrame({"nombre_concepto": ["Otros"], "total": [otros_val], "cantidad": [otros_cant]})
+                otros_row = pd.DataFrame(
+                    {"nombre_concepto": ["Otros"], "total": [otros_val], "cantidad": [otros_cant]}
+                )
                 df_bars = pd.concat([top_part, otros_row], ignore_index=True)
 
-            df_bars = df_bars.sort_values("total", ascending=False).copy()
+            df_bars = df_bars.sort_values("total", ascending=False)
             x_order = df_bars["nombre_concepto"].tolist()
             df_bars["nombre_concepto"] = pd.Categorical(
                 df_bars["nombre_concepto"], categories=x_order, ordered=True
@@ -1099,6 +1112,7 @@ if not sin_datos:
                     "Los indicadores reflejan solo los grupos visibles en la leyenda."
                 )
 
+
     st.markdown(
         "<hr style='margin:0.35rem 0;border:0;border-top:1px solid rgba(127,127,127,0.25);'/>",
         unsafe_allow_html=True,
@@ -1113,7 +1127,7 @@ if not sin_datos:
         key="meses_evolucion_total",
     )
     periodos_total = get_periodos_evolucion(periodos_sorted, periodo_sql, meses_total)
-    df_total_hist = historico_desde_getter(periodos_total, get_total_facturado_sp)
+    df_total_hist = fetch_totales_por_periodos(engine, periodos_total, SERVICIO_FC)
     if df_total_hist.empty or float(df_total_hist["total_facturado"].sum()) <= 0:
         st.info("No hay datos históricos de total facturado.")
     else:

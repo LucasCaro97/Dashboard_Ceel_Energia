@@ -21,6 +21,7 @@ from .config import (
     TABLA_MEDIDORES,
     TABLA_TARIFAS,
     TABLA_TARIFA_BASE,
+    TIENE_MEDIDORES,
     TARIFA_EQUIVALENCIAS,
 )
 
@@ -36,6 +37,7 @@ TELEVISION_CONFIG = SectorSyncConfig(
     tabla_tarifa_base=TABLA_TARIFA_BASE,
     tarifa_equivalencias=TARIFA_EQUIVALENCIAS,
     reportes_dir=ROOT / "data" / "television" / "reportes_sincro",
+    tiene_medidores=TIENE_MEDIDORES,
 )
 
 

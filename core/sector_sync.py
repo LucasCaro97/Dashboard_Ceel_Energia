@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -76,6 +76,8 @@ class SectorSyncConfig:
             medidores (util para sectores de tarifa plana como Internet o
             Television donde no hay medicion por consumo).
         motivo_cambio_tarifa: Texto registrado al crear/cambiar una tarifa.
+        id_servicio: Si se indica, limita el mapeo de tarifas a ese id_servicio
+            en tarifas_base (recomendado cuando hay nombres repetidos entre sectores).
     """
     servicio_objetivo: str
     db_schema: str
@@ -87,6 +89,7 @@ class SectorSyncConfig:
     reportes_dir: Path
     tiene_medidores: bool = True
     motivo_cambio_tarifa: str = MOTIVO_CAMBIO_TARIFA_DEFAULT
+    id_servicio: Optional[int] = None
 
 
 @dataclass
@@ -122,6 +125,16 @@ def parse_fecha_fuente(df: pd.DataFrame):
     if pd.isna(fecha):
         raise ValueError(f"fecha_fuente invalida: {serie.iloc[0]}")
     return fecha.date()
+
+
+def inicio_periodo_facturacion(fecha_fuente: date) -> date:
+    """Primer dia del mes de la fecha fuente (periodo al que aplica el snapshot).
+
+    El flujo mensual sincroniza socios cualquier dia del mes (ej. 10/08) y
+    luego carga facturas con periodo = 01/MM/AAAA. Las vigencias deben
+    abrirse en ese 01/MM para que el consolidado las matchee.
+    """
+    return fecha_fuente.replace(day=1)
 
 
 def normalizar_texto(valor: object) -> str:
@@ -350,7 +363,8 @@ def ejecutar_sync_sector(
       3. Abre una transaccion MySQL.
       4. Upsert en tabla de socios via staging table.
       5. Inserta medidores nuevos e inactiva los ausentes.
-      6. Cierra vigencias de tarifa cambiadas e inserta las nuevas.
+      6. Cierra vigencias de tarifa cambiadas e inserta las nuevas
+         (fecha_desde = 1er dia del mes de fecha_fuente).
       7. Commit (o rollback si dry_run=True).
       8. Genera reportes CSV si se solicita.
 
@@ -374,10 +388,16 @@ def ejecutar_sync_sector(
 
     df_sector["servicio_tipo"] = config.servicio_objetivo
     fecha_fuente = parse_fecha_fuente(df_sector)
-    fecha_cierre = fecha_fuente - timedelta(days=1)
+    # Vigencia alineada al periodo de facturacion (01/MM), no al dia del CSV.
+    fecha_desde_vigencia = inicio_periodo_facturacion(fecha_fuente)
+    fecha_cierre = fecha_desde_vigencia - timedelta(days=1)
 
     print(f"\n  Procesando {len(df_sector):,} filas de servicio '{config.servicio_objetivo}'")
-    print(f"  Fecha fuente: {fecha_fuente}  /  Fecha cierre vigencias: {fecha_cierre}")
+    print(
+        f"  Fecha fuente: {fecha_fuente}  /  "
+        f"Vigencia desde: {fecha_desde_vigencia}  /  "
+        f"Cierre anteriores: {fecha_cierre}"
+    )
 
     socios_df = consolidar_socios(df_sector)
     medidores_df = consolidar_medidores(df_sector)
@@ -401,10 +421,16 @@ def ejecutar_sync_sector(
             # ----------------------------------------------------------------
             # 1. Resolver IDs de tarifa base
             # ----------------------------------------------------------------
-            df_tarifa_base = pd.read_sql(
-                text(f"SELECT id_tarifa, nombre_tarifa FROM {t_tarifa_base}"),
-                conn,
-            )
+            if config.id_servicio is not None:
+                tarifa_sql = (
+                    f"SELECT id_tarifa, nombre_tarifa FROM {t_tarifa_base} "
+                    f"WHERE id_servicio = :id_servicio"
+                )
+                tarifa_params = {"id_servicio": int(config.id_servicio)}
+            else:
+                tarifa_sql = f"SELECT id_tarifa, nombre_tarifa FROM {t_tarifa_base}"
+                tarifa_params = {}
+            df_tarifa_base = pd.read_sql(text(tarifa_sql), conn, params=tarifa_params)
             exact_map, candidates, alias_map = build_tarifa_mapper(
                 df_tarifa_base, config.tarifa_equivalencias
             )
@@ -644,6 +670,16 @@ def ejecutar_sync_sector(
 
             # ----------------------------------------------------------------
             # 5. Actualizar historial de tarifas (cerrar vigentes y abrir nuevas)
+            #
+            # Las facturas usan periodo = 01/MM/AAAA. Por eso las vigencias
+            # nuevas se abren en fecha_desde_vigencia (1er dia del mes de
+            # fecha_fuente), no en el dia del CSV.
+            #
+            # - Vigente de un mes anterior + tarifa distinta:
+            #     cierra el ultimo dia del mes previo e inserta desde el 01/MM.
+            # - Vigente ya abierta en este mes (re-sync / backdate):
+            #     actualiza id_tarifa_base y/o fecha_desde al 01/MM in-place.
+            # - Sin vigente: inserta desde el 01/MM.
             # ----------------------------------------------------------------
             conn.execute(text("DROP TEMPORARY TABLE IF EXISTS stg_tarifas_objetivo"))
             conn.execute(
@@ -670,6 +706,7 @@ def ejecutar_sync_sector(
                         orient="records"
                     ),
                 )
+            # 5a. Cerrar vigentes de meses anteriores cuando cambia la tarifa.
             conn.execute(
                 text(
                     f"""
@@ -679,28 +716,81 @@ def ejecutar_sync_sector(
                       AND s.servicio_tipo = h.servicio_tipo
                     SET h.fecha_hasta = :fecha_cierre
                     WHERE h.fecha_hasta IS NULL
+                      AND h.fecha_desde < :fecha_desde_vigencia
                       AND COALESCE(h.id_tarifa_base, -1) <> COALESCE(s.id_tarifa_base, -1)
                     """
                 ),
-                {"fecha_cierre": fecha_cierre},
+                {
+                    "fecha_cierre": fecha_cierre,
+                    "fecha_desde_vigencia": fecha_desde_vigencia,
+                },
             )
+            # 5a2. Evitar solapes: si una vigencia cerrada entra en el mes
+            #     actual (ej. sync previo con fecha a mitad de mes), recortarla
+            #     al ultimo dia del mes anterior.
+            conn.execute(
+                text(
+                    f"""
+                    UPDATE {t_tarifas} h
+                    JOIN stg_tarifas_objetivo s
+                      ON  s.nro_socio     = h.nro_socio
+                      AND s.servicio_tipo = h.servicio_tipo
+                    SET h.fecha_hasta = :fecha_cierre
+                    WHERE h.fecha_hasta IS NOT NULL
+                      AND h.fecha_hasta >= :fecha_desde_vigencia
+                      AND h.fecha_desde < :fecha_desde_vigencia
+                    """
+                ),
+                {
+                    "fecha_cierre": fecha_cierre,
+                    "fecha_desde_vigencia": fecha_desde_vigencia,
+                },
+            )
+            # 5b. Re-sync / correccion del mismo mes: ajustar in-place
+            #     (incluye backdate de fecha_desde a 01/MM si quedo a mitad).
+            conn.execute(
+                text(
+                    f"""
+                    UPDATE {t_tarifas} h
+                    JOIN stg_tarifas_objetivo s
+                      ON  s.nro_socio     = h.nro_socio
+                      AND s.servicio_tipo = h.servicio_tipo
+                    SET h.id_tarifa_base = s.id_tarifa_base,
+                        h.fecha_desde    = :fecha_desde_vigencia,
+                        h.motivo_cambio  = :motivo
+                    WHERE h.fecha_hasta IS NULL
+                      AND h.fecha_desde >= :fecha_desde_vigencia
+                      AND (
+                            COALESCE(h.id_tarifa_base, -1) <> COALESCE(s.id_tarifa_base, -1)
+                         OR h.fecha_desde > :fecha_desde_vigencia
+                      )
+                    """
+                ),
+                {
+                    "fecha_desde_vigencia": fecha_desde_vigencia,
+                    "motivo": config.motivo_cambio_tarifa,
+                },
+            )
+            # 5c. Abrir vigencia nueva solo si no queda ninguna abierta.
             conn.execute(
                 text(
                     f"""
                     INSERT INTO {t_tarifas}
                         (nro_socio, servicio_tipo, id_tarifa_base, fecha_desde, fecha_hasta, motivo_cambio)
                     SELECT s.nro_socio, s.servicio_tipo, s.id_tarifa_base,
-                           :fecha_fuente, NULL, :motivo
+                           :fecha_desde_vigencia, NULL, :motivo
                     FROM stg_tarifas_objetivo s
                     LEFT JOIN {t_tarifas} h
                       ON  h.nro_socio     = s.nro_socio
                       AND h.servicio_tipo = s.servicio_tipo
                       AND h.fecha_hasta IS NULL
                     WHERE h.id_historial IS NULL
-                       OR COALESCE(h.id_tarifa_base, -1) <> COALESCE(s.id_tarifa_base, -1)
                     """
                 ),
-                {"fecha_fuente": fecha_fuente, "motivo": config.motivo_cambio_tarifa},
+                {
+                    "fecha_desde_vigencia": fecha_desde_vigencia,
+                    "motivo": config.motivo_cambio_tarifa,
+                },
             )
 
             # ----------------------------------------------------------------

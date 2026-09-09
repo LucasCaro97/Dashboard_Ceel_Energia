@@ -72,7 +72,12 @@ def _fecha_desde_nombre(path: Path):
     return None
 
 
-def normalizar(ruta_csv: Path, ruta_salida: Path, servicio_tipo: str = None) -> pd.DataFrame:
+def normalizar(
+    ruta_csv: Path,
+    ruta_salida: Path,
+    servicio_tipo: str = None,
+    servicio_aliases: dict = None,
+) -> pd.DataFrame:
     """
     Normaliza un CSV de socios exportado desde TRYLOGYC.
 
@@ -84,6 +89,8 @@ def normalizar(ruta_csv: Path, ruta_salida: Path, servicio_tipo: str = None) -> 
         ruta_csv: Ruta del CSV crudo de TRYLOGYC.
         ruta_salida: Ruta donde guardar el CSV normalizado.
         servicio_tipo: Nombre del servicio a reportar en el resumen (opcional).
+        servicio_aliases: Mapeo opcional TRYLOGYC -> nombre canonico en columna
+            ``servicio`` (ej. {"TV Cable": "Television"}).
 
     Returns:
         pd.DataFrame con los registros normalizados (todos los servicios).
@@ -123,6 +130,9 @@ def normalizar(ruta_csv: Path, ruta_salida: Path, servicio_tipo: str = None) -> 
     df["fecha_fuente"] = fecha_fuente
     print(f"  Fecha del archivo: {fecha_fuente}")
 
+    if servicio_aliases:
+        df["servicio"] = df["servicio"].replace(servicio_aliases)
+
     df = df[[
         "nro_socio",
         "nombre_socio",
@@ -157,10 +167,21 @@ def normalizar(ruta_csv: Path, ruta_salida: Path, servicio_tipo: str = None) -> 
 
 
 def archivo_mas_reciente(carpeta: Path) -> Path:
-    """Devuelve el lista_socios_*.csv mas reciente en la carpeta indicada."""
-    candidatos = sorted(carpeta.glob("lista_socios_*.csv"), reverse=True)
+    """Devuelve el lista_socios_*.csv mas reciente segun la fecha del nombre.
+
+    El nombre usa formato DDMMAAAA (ej. lista_socios_06082026.csv = 2026-08-06).
+    No se ordena por string del filename: lexicograficamente ``18062026``
+    (18/06) gana a ``06082026`` (06/08), aunque sea mas viejo.
+    """
+    candidatos = list(carpeta.glob("lista_socios_*.csv"))
     if not candidatos:
         raise FileNotFoundError(
             f"No se encontro ningun lista_socios_*.csv en {carpeta}"
         )
-    return candidatos[0]
+
+    def _clave_recencia(path: Path):
+        fecha = _fecha_desde_nombre(path)
+        # Fecha ISO primero; si no parsea, cae a mtime del archivo.
+        return (fecha or "", path.stat().st_mtime)
+
+    return max(candidatos, key=_clave_recencia)

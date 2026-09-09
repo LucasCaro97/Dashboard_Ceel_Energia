@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Processor for Internet sector billing.
-Injects billing concept data from TRYLOGYC into the database.
+Processor for Gas (GAS ENVASADO) billing.
+Injects billing concept data from TXT into the database.
 """
 
 import glob
@@ -10,30 +10,51 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+from sqlalchemy import text
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from core.db_manager import (
-    get_db_config,
     build_sqlalchemy_engine,
+    get_db_config,
     inyectar_a_mysql,
     obtener_maestro_conceptos,
 )
 from core.dry_run_report import imprimir_resumen_dry_run
-from .config import TABLA_FACTURACION, SERVICIO_TIPO
+from .config import SERVICIO_TXT_ALIASES, TABLA_FACTURACION
 
 
-def procesar_periodo(anio, mes, sector="internet"):
+def _mapear_servicio_real(servicio_norm: str) -> str:
     """
-    Reads TXT billing files for a specific period.
+    Mapea el servicio normalizado (ej: gas_envasado) al nombre exacto
+    en la tabla `servicios` (ej: 'GAS ENVASADO'), para que los JOINs por
+    nombre funcionen en MySQL.
+    """
+    try:
+        engine = build_sqlalchemy_engine(get_db_config())
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT nombre_servicio
+                    FROM servicios
+                    WHERE LOWER(REPLACE(nombre_servicio, ' ', '_')) = :sn
+                    LIMIT 1
+                    """
+                ),
+                {"sn": servicio_norm},
+            ).fetchone()
+        if row and row[0]:
+            return str(row[0])
+    except Exception:
+        pass
+    return servicio_norm
 
-    Args:
-        anio (str): Year to process (e.g. "2026")
-        mes (str): Month to process (e.g. "05")
-        sector (str): Sector folder name under data/
 
-    Returns:
-        pd.DataFrame: Normalized data, or None if no files found
+def procesar_periodo(anio, mes, sector="gas"):
+    """
+    Reads TXT billing files for a specific period and normalizes them.
+    TXT naming: <servicio>_<id_concepto>.txt (e.g. gas_1.txt)
     """
     ruta_periodo = f"./data/{sector}/inbox/{anio}/{mes}"
     archivos = glob.glob(os.path.join(ruta_periodo, "**", "*.txt"), recursive=True)
@@ -48,40 +69,39 @@ def procesar_periodo(anio, mes, sector="internet"):
         df = pd.read_csv(archivo, sep=";", encoding="latin1")
         df = df.drop(df.columns[0], axis=1).iloc[:, 0:8]
         df.columns = [
-            "Socio_Con", "Nombre", "Direccion", "Nro_Factura",
-            "Socio", "Cantidad", "Importe", "Total",
+            "Socio_Con",
+            "Nombre",
+            "Direccion",
+            "Nro_Factura",
+            "Socio",
+            "Cantidad",
+            "Importe",
+            "Total",
         ]
         df = df.dropna(how="all")
 
         nombre_base = os.path.basename(archivo).replace(".txt", "")
         partes = nombre_base.rsplit("_", 1)
         df["id_concepto"] = int(partes[1])
-        df["servicio"] = partes[0]
+
+        servicio_txt = partes[0].lower()
+        df["servicio"] = SERVICIO_TXT_ALIASES.get(servicio_txt, servicio_txt)
         df["periodo"] = f"{anio}-{mes}-01"
         dataframes.append(df)
 
     return pd.concat(dataframes, ignore_index=True)
 
 
-def procesar_facturacion(anio, mes, sector="internet", dry_run=False):
+def procesar_facturacion(anio, mes, sector="gas", dry_run=False):
     """
-    Complete billing processing pipeline for Internet:
-    1. Reads TXTs from data/internet/inbox/{anio}/{mes}/
-    2. Normalizes and validates against master concepts
+    Complete billing processing pipeline for Gas:
+    1. Reads TXTs from data/gas/inbox/{anio}/{mes}/
+    2. Validates against master concepts
     3. Injects into facturacion_conceptos (skipped in dry_run)
-    4. Generates control Excel in data/internet/processed/{anio}/{mes}/
-
-    Args:
-        anio (str): Year to process
-        mes (str): Month to process
-        sector (str): Sector (default "internet")
-        dry_run (bool): If True, runs all validations but skips DB injection
-
-    Returns:
-        bool: True if successful (or dry_run passed), False if error
+    4. Generates control Excel in data/gas/processed/{anio}/{mes}/
     """
     modo = "[DRY RUN] " if dry_run else ""
-    print(f"--- {modo}Starting Internet billing processing ---")
+    print(f"--- {modo}Starting Gas billing processing ---")
 
     df_final = procesar_periodo(anio, mes, sector)
     if df_final is None:
@@ -95,8 +115,7 @@ def procesar_facturacion(anio, mes, sector="internet", dry_run=False):
         return False
     print("Database connected and master loaded.")
 
-    cols_a_limpiar = ["Importe", "Total", "Cantidad"]
-    for col in cols_a_limpiar:
+    for col in ["Importe", "Total", "Cantidad"]:
         df_final[col] = (
             df_final[col]
             .astype(str)
@@ -118,29 +137,42 @@ def procesar_facturacion(anio, mes, sector="internet", dry_run=False):
         print("-------------------------------------------------------\n")
         return False
 
-    df_final = df_final.rename(columns={
-        "Socio_Con":   "nro_socio",
-        "Nombre":      "nombre_socio",
-        "Nro_Factura": "nro_factura",
-        "Socio":       "es_socio",
-        "Cantidad":    "cantidad_cons",
-        "Importe":     "importe",
-        "Total":       "total",
-    })
+    df_final = df_final.rename(
+        columns={
+            "Socio_Con": "nro_socio",
+            "Nombre": "nombre_socio",
+            "Nro_Factura": "nro_factura",
+            "Socio": "es_socio",
+            "Cantidad": "cantidad_cons",
+            "Importe": "importe",
+            "Total": "total",
+        }
+    )
 
     if dry_run:
         imprimir_resumen_dry_run(df_final, anio, mes, TABLA_FACTURACION)
 
     df_final = df_final.drop(
-        columns=["nombre_concepto", "es_consumo_total", "grupo_usuario",
-                 "es_consumo_escalonado", "Direccion"],
+        columns=[
+            "nombre_concepto",
+            "es_consumo_total",
+            "grupo_usuario",
+            "es_consumo_escalonado",
+            "Direccion",
+        ],
         errors="ignore",
     )
+
+    # En la tabla facturacion_conceptos, `servicio` debe coincidir con `servicios.nombre_servicio`
+    # para que los JOINs en SQL/SP funcionen.
+    if not df_final.empty and "servicio" in df_final.columns:
+        servicio_norm = str(df_final["servicio"].iloc[0]).strip()
+        df_final["servicio"] = _mapear_servicio_real(servicio_norm)
 
     ruta_salida = f"./data/{sector}/processed/{anio}/{mes}"
     os.makedirs(ruta_salida, exist_ok=True)
     sufijo = "_dry_run" if dry_run else ""
-    nombre_archivo = f"{ruta_salida}/INTERNET_conceptos_facturados_{anio}_{mes}{sufijo}.xlsx"
+    nombre_archivo = f"{ruta_salida}/{sector.upper()}_conceptos_facturados_{anio}_{mes}{sufijo}.xlsx"
     df_final.to_excel(nombre_archivo, index=False)
     print(f"File generated: {nombre_archivo}")
 
@@ -150,15 +182,14 @@ def procesar_facturacion(anio, mes, sector="internet", dry_run=False):
     if inyectar_a_mysql(df_final, TABLA_FACTURACION):
         print("--- Processing finished successfully ---")
         return True
-    else:
-        print("--- Processing finished with error ---")
-        return False
+    print("--- Processing finished with error ---")
+    return False
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Procesa facturación Internet.")
+    parser = argparse.ArgumentParser(description="Procesa facturacion Gas (GAS ENVASADO).")
     parser.add_argument("--año", required=True)
     parser.add_argument("--mes", required=True)
     parser.add_argument(
@@ -168,3 +199,4 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     procesar_facturacion(args.año, args.mes, dry_run=args.dry_run)
+

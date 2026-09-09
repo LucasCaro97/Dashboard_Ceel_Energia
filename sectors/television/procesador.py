@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Processor for Internet sector billing.
+Processor for Television sector billing.
 Injects billing concept data from TRYLOGYC into the database.
 """
 
@@ -13,23 +13,18 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from core.db_manager import (
-    get_db_config,
-    build_sqlalchemy_engine,
-    inyectar_a_mysql,
-    obtener_maestro_conceptos,
-)
+from core.db_manager import inyectar_a_mysql, obtener_maestro_conceptos
 from core.dry_run_report import imprimir_resumen_dry_run
-from .config import TABLA_FACTURACION, SERVICIO_TIPO
+from .config import SERVICIO_TXT_ALIASES, TABLA_FACTURACION
 
 
-def procesar_periodo(anio, mes, sector="internet"):
+def procesar_periodo(anio, mes, sector="television"):
     """
     Reads TXT billing files for a specific period.
 
     Args:
         anio (str): Year to process (e.g. "2026")
-        mes (str): Month to process (e.g. "05")
+        mes (str): Month to process (e.g. "06")
         sector (str): Sector folder name under data/
 
     Returns:
@@ -56,32 +51,24 @@ def procesar_periodo(anio, mes, sector="internet"):
         nombre_base = os.path.basename(archivo).replace(".txt", "")
         partes = nombre_base.rsplit("_", 1)
         df["id_concepto"] = int(partes[1])
-        df["servicio"] = partes[0]
+        servicio_txt = partes[0].lower()
+        df["servicio"] = SERVICIO_TXT_ALIASES.get(servicio_txt, servicio_txt)
         df["periodo"] = f"{anio}-{mes}-01"
         dataframes.append(df)
 
     return pd.concat(dataframes, ignore_index=True)
 
 
-def procesar_facturacion(anio, mes, sector="internet", dry_run=False):
+def procesar_facturacion(anio, mes, sector="television", dry_run=False):
     """
-    Complete billing processing pipeline for Internet:
-    1. Reads TXTs from data/internet/inbox/{anio}/{mes}/
+    Complete billing processing pipeline for Television:
+    1. Reads TXTs from data/television/inbox/{anio}/{mes}/
     2. Normalizes and validates against master concepts
     3. Injects into facturacion_conceptos (skipped in dry_run)
-    4. Generates control Excel in data/internet/processed/{anio}/{mes}/
-
-    Args:
-        anio (str): Year to process
-        mes (str): Month to process
-        sector (str): Sector (default "internet")
-        dry_run (bool): If True, runs all validations but skips DB injection
-
-    Returns:
-        bool: True if successful (or dry_run passed), False if error
+    4. Generates control Excel in data/television/processed/{anio}/{mes}/
     """
     modo = "[DRY RUN] " if dry_run else ""
-    print(f"--- {modo}Starting Internet billing processing ---")
+    print(f"--- {modo}Starting Television billing processing ---")
 
     df_final = procesar_periodo(anio, mes, sector)
     if df_final is None:
@@ -140,7 +127,7 @@ def procesar_facturacion(anio, mes, sector="internet", dry_run=False):
     ruta_salida = f"./data/{sector}/processed/{anio}/{mes}"
     os.makedirs(ruta_salida, exist_ok=True)
     sufijo = "_dry_run" if dry_run else ""
-    nombre_archivo = f"{ruta_salida}/INTERNET_conceptos_facturados_{anio}_{mes}{sufijo}.xlsx"
+    nombre_archivo = f"{ruta_salida}/TELEVISION_conceptos_facturados_{anio}_{mes}{sufijo}.xlsx"
     df_final.to_excel(nombre_archivo, index=False)
     print(f"File generated: {nombre_archivo}")
 
@@ -150,15 +137,15 @@ def procesar_facturacion(anio, mes, sector="internet", dry_run=False):
     if inyectar_a_mysql(df_final, TABLA_FACTURACION):
         print("--- Processing finished successfully ---")
         return True
-    else:
-        print("--- Processing finished with error ---")
-        return False
+
+    print("--- Processing finished with error ---")
+    return False
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Procesa facturación Internet.")
+    parser = argparse.ArgumentParser(description="Procesa facturacion Television.")
     parser.add_argument("--año", required=True)
     parser.add_argument("--mes", required=True)
     parser.add_argument(

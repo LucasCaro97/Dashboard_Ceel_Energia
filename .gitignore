@@ -21,3 +21,6 @@ Thumbs.db
 # Archivos de datos locales (no subir a GitHub)
 medidores_normalizados.csv
 medidores_sin_procesar.xlsx
+*.xlsx
+
+
